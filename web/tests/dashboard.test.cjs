@@ -11,7 +11,7 @@ const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(resol
 async function boot(options = {}) {
   const {window, document} = parseHTML(html);
   const $ = id => document.getElementById(id);
-  for (const [id, value] of [['symbol', 'AAPL'], ['order-type', 'market']]) Object.defineProperty($(id), 'value', {writable: true, value});
+  for (const [id, value] of [['symbol', 'AAPL'], ['order-type', 'market'], ['watchlist-page-select', '0']]) Object.defineProperty($(id), 'value', {writable: true, value});
   window.HTMLElement.prototype.showModal = function () { this.open = true; };
   window.HTMLElement.prototype.close = function () { this.open = false; };
   const saved = options.saved || new Map();
@@ -27,6 +27,14 @@ async function boot(options = {}) {
     if (options.offline) throw new TypeError('Failed to fetch');
     if (path === '/api/health') data = {broker_configured: options.configured !== false, setup_message: options.configured === false ? 'Configure Alpaca paper keys in .env, then restart Uvicorn.' : null, market_stream: options.stream === true, public_market_data: options.publicData === true};
     else if (path === '/api/account') data = {cash: '90000', equity: '100000', buying_power: '180000'};
+    else if (path === '/api/stocks/sp500') {
+      if (options.sp500Failure) return new Response(JSON.stringify({detail: 'S&P 500 company list is unavailable'}), {status: 502, headers: {'Content-Type': 'application/json'}});
+      const results = options.sp500Results || [
+        ...['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'TSLA'].map(symbol => ({symbol, name: symbol + ' Company'})),
+        ...Array.from({length: 495}, (_, index) => ({symbol: 'S' + String(index).padStart(3, '0'), name: 'Constituent ' + index}))
+      ];
+      data = {results, count: results.length, source: 'test membership source', fetched_at: date};
+    }
     else if (path === '/api/stocks/search') {
       if (options.searchHandler) return options.searchHandler(url, init);
       if (options.searchFailure) return new Response(JSON.stringify({detail: 'Stock search is temporarily unavailable'}), {status: 502, headers: {'Content-Type': 'application/json'}});
@@ -320,12 +328,12 @@ test('watchlists can be emptied and rebuilt without loading a hidden default sto
 });
 
 test('watchlist limits, unavailable storage and unsafe saved names are handled safely', async () => {
-  const saved = new Map([['trade-watchlist-v1', JSON.stringify(Array.from({length: 20}, (_, i) => ({symbol: 'S' + i, name: 'Stock ' + i})))]]);
+  const saved = new Map([['trade-watchlist-v1', JSON.stringify(Array.from({length: 1000}, (_, i) => ({symbol: 'S' + i, name: 'Stock ' + i})))]]);
   const full = await boot({saved});
   await full.click('#open-stock-search'); full.$('stock-query').value = 'Amazon'; await full.submit('stock-search-form');
   assert.equal(full.$('stock-results').querySelector('[data-add-stock="AMZN"]').disabled, true);
   await full.click('[data-add-stock="AMZN"]');
-  assert.equal(JSON.parse(saved.get('trade-watchlist-v1')).length, 20);
+  assert.equal(JSON.parse(saved.get('trade-watchlist-v1')).length, 1000);
   const blocked = await boot({storageFailure: true});
   await blocked.click('#open-stock-search'); blocked.$('stock-query').value = 'Amazon'; await blocked.submit('stock-search-form'); await blocked.click('[data-add-stock="AMZN"]');
   assert.match(blocked.$('watchlist-status').textContent, /storage is unavailable/);
@@ -366,5 +374,63 @@ test('custom watchlist stocks are included in the authenticated live feed', asyn
     await app.click('[data-remove-stock="AMZN"]');
     const latest = app.calls.filter(call => call.path === '/api/market/stream').at(-1);
     assert.ok(!new URL(latest.url).searchParams.get('symbols').split(',').includes('AMZN'));
+  } finally { await app.close(); }
+});
+
+
+test('bulk S&P 500 addition saves the complete list, deduplicates and loads prices only for the visible page', async () => {
+  const app = await boot({configured: false, publicData: true});
+  const before = app.calls.length;
+  await app.click('#add-sp500');
+  assert.equal(app.$('watchlist-count').textContent, '500');
+  assert.equal(JSON.parse(app.saved.get('trade-watchlist-v1')).length, 500);
+  assert.equal(app.$('watchlist-body').querySelectorAll('tr').length, 20);
+  assert.equal(app.$('stock-tabs').querySelectorAll('button').length, 20);
+  assert.match(app.$('watchlist-page-label').textContent, /1–20 of 500/);
+  assert.ok(app.calls.slice(before).filter(call => call.path.endsWith('/quote')).length <= 21);
+  await app.click('#add-sp500');
+  assert.equal(JSON.parse(app.saved.get('trade-watchlist-v1')).length, 500);
+  const restored = await boot({saved: app.saved, configured: false, publicData: true});
+  assert.equal(restored.$('watchlist-count').textContent, '500');
+  assert.equal(restored.$('watchlist-body').querySelectorAll('tr').length, 20);
+  assert.ok(restored.calls.filter(call => call.path.endsWith('/quote')).length <= 21);
+  await restored.click('#watchlist-next');
+  assert.match(restored.$('watchlist-page-label').textContent, /21–40 of 500/);
+  assert.equal(restored.$('watchlist-body').querySelectorAll('tr').length, 20);
+  const pageSymbols = [...restored.$('stock-tabs').querySelectorAll('button')].map(button => button.textContent);
+  assert.equal(restored.$('symbol').value, pageSymbols[0]);
+  await restored.click('#watchlist-prev');
+  assert.match(restored.$('watchlist-page-label').textContent, /1–20 of 500/);
+  assert.equal(restored.submitCount, 0);
+});
+
+test('bulk source failures leave the current watchlist intact and search can jump to saved constituents', async () => {
+  const app = await boot({sp500Failure: true, configured: false, publicData: true});
+  await app.click('#add-sp500');
+  assert.equal(app.$('watchlist-count').textContent, '5');
+  assert.equal(app.saved.get('trade-watchlist-v1'), undefined);
+  assert.match(app.$('watchlist-status').textContent, /unavailable/);
+  app.options.sp500Failure = false; await app.click('#add-sp500');
+  app.options.searchResults = [{symbol: 'S400', name: 'Constituent 400'}];
+  await app.click('#open-stock-search'); app.$('stock-query').value = 'S400'; await app.submit('stock-search-form');
+  await app.click('[data-view-stock="S400"]');
+  assert.equal(app.$('symbol').value, 'S400');
+  assert.ok(app.$('stock-tabs').querySelector('[data-stock="S400"]'));
+  assert.match(app.$('watchlist-body').textContent, /S400/);
+  assert.equal(app.$('stock-dialog').open, false);
+});
+
+test('large watchlist streams are bounded to the selected page', async () => {
+  const app = await boot({stream: true});
+  try {
+    await app.click('#add-sp500');
+    let stream = app.calls.filter(call => call.path === '/api/market/stream').at(-1);
+    assert.equal(new URL(stream.url).searchParams.get('symbols').split(',').length, 20);
+    await app.click('#watchlist-next');
+    stream = app.calls.filter(call => call.path === '/api/market/stream').at(-1);
+    const symbols = new URL(stream.url).searchParams.get('symbols').split(',');
+    assert.equal(symbols.length, 20);
+    assert.ok(!symbols.includes('AAPL'));
+    assert.equal(app.$('symbol').value, symbols[0]);
   } finally { await app.close(); }
 });

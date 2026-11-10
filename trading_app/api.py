@@ -23,6 +23,7 @@ from .service import OrderDraft, OrderStore, RiskLimits, TradeError, TradingServ
 from .market_stream import MarketStream, stream_events, watch_symbols
 from .public_market_data import PublicMarketData, PublicDataError
 from .stock_search import StockSearch, query_text
+from .sp500_catalog import SP500Catalog
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,7 +33,7 @@ class SubmitRequest(BaseModel):
     review_id: UUID
 
 
-def create_app(broker=None, db_path=None, limits=None, access_token=None, allowed_origins=None, public_client=None):
+def create_app(broker=None, db_path=None, limits=None, access_token=None, allowed_origins=None, public_client=None, sp500_catalog=None):
     load_dotenv(ROOT / '.env')
     token = access_token if access_token is not None else os.getenv('API_ACCESS_TOKEN', '')
     origins = allowed_origins if allowed_origins is not None else [s.strip() for s in os.getenv('ALLOWED_ORIGINS', '').split(',') if s.strip()]
@@ -46,11 +47,12 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         if application.state.market_stream is not None:
             await application.state.market_stream.close()
 
-    application = FastAPI(title='Trade Paper API', version='1.3.0', lifespan=lifespan, description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
+    application = FastAPI(title='Trade Paper API', version='1.4.0', lifespan=lifespan, description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
     application.state.market_stream = None
     application.state.broker = broker
     application.state.public_market_data = public_client or PublicMarketData()
     application.state.stock_search = StockSearch(application.state.public_market_data)
+    application.state.sp500_catalog = sp500_catalog or SP500Catalog()
     public_enabled = os.getenv('PUBLIC_MARKET_DATA', 'true').strip().lower() in {'true', '1', 'yes'}
     application.state.store = store
     application.state.limits = limits
@@ -221,6 +223,10 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         if configured_broker is None and not public_enabled:
             raise HTTPException(503, setup_message)
         return application.state.stock_search.search(query, configured_broker)
+
+    @application.get('/api/stocks/sp500')
+    def sp500_constituents(_=Depends(authorize)):
+        return application.state.sp500_catalog.constituents()
 
     @application.get('/api/market/{symbol}/quote')
     def quote(symbol: str, source=Depends(market_source)):

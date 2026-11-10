@@ -13,7 +13,44 @@ const quantity = value => new Intl.NumberFormat('en-US', {maximumFractionDigits:
 const time = value => value ? new Date(value).toLocaleString() : 'Unavailable';
 const storage = {get(key, session = false) { try { return (session ? sessionStorage : localStorage).getItem(key) || ''; } catch { return ''; } }, set(key, value, session = false) { try { (session ? sessionStorage : localStorage).setItem(key, value); return true; } catch { return false; } }};
 const WATCHLIST_KEY = 'trade-watchlist-v1';
-const MAX_WATCHLIST = 20;
+const MAX_WATCHLIST = 1000;
+const WATCHLIST_PAGE_SIZE = 20;
+let watchlistPage = 0, bulkAdding = false;
+function pageStocks() {
+  return STOCKS.slice(watchlistPage * WATCHLIST_PAGE_SIZE, (watchlistPage + 1) * WATCHLIST_PAGE_SIZE);
+}
+function renderPageControls() {
+  const totalPages = Math.max(1, Math.ceil(STOCKS.length / WATCHLIST_PAGE_SIZE));
+  watchlistPage = Math.max(0, Math.min(watchlistPage, totalPages - 1));
+  const select = $('watchlist-page-select'), key = `${STOCKS.length}:${watchlistPage}`;
+  if (select.dataset.pageState !== key) {
+    select.replaceChildren();
+    for (let page = 0; page < totalPages; page++) {
+      const option = element('option', `Page ${page + 1} of ${totalPages}`); option.value = page;
+      select.append(option);
+    }
+    select.value = String(watchlistPage); select.dataset.pageState = key;
+  }
+  select.disabled = totalPages === 1;
+  $('watchlist-prev').disabled = watchlistPage === 0;
+  $('watchlist-next').disabled = watchlistPage >= totalPages - 1;
+  const first = STOCKS.length ? watchlistPage * WATCHLIST_PAGE_SIZE + 1 : 0;
+  $('watchlist-page-label').textContent = `${first}–${Math.min((watchlistPage + 1) * WATCHLIST_PAGE_SIZE, STOCKS.length)} of ${STOCKS.length} listings`;
+}
+async function refreshPagePrices() {
+  if (!(marketConnected || connected)) return;
+  await Promise.allSettled(pageStocks().map(async stock => {
+    try { saveSnapshot(stock.symbol, await api(`/api/market/${stock.symbol}/quote`)); } catch { /* Timestamps remain visible for previously loaded values. */ }
+  }));
+  renderWatchlist();
+}
+function setWatchlistPage(page) {
+  const total = Math.max(1, Math.ceil(STOCKS.length / WATCHLIST_PAGE_SIZE));
+  watchlistPage = Math.max(0, Math.min(Number(page) || 0, total - 1));
+  selectionEpoch++; selected = pageStocks()[0] || DEFAULT_STOCKS[0]; currentBars = [];
+  renderStockSelectors(); renderWatchlist(); selectStock(selected.symbol);
+  restartWatchlistStream(); refreshPagePrices();
+}
 function validStock(value) {
   if (!value || typeof value.symbol !== 'string') return null;
   const symbol = value.symbol.trim().toUpperCase();
@@ -173,18 +210,24 @@ async function loadSelected() {
 }
 function selectStock(symbol) {
   selected = STOCKS.find(stock => stock.symbol === symbol) || STOCKS[0] || DEFAULT_STOCKS[0];
+  const index = STOCKS.findIndex(stock => stock.symbol === selected.symbol);
+  const nextPage = index >= 0 ? Math.floor(index / WATCHLIST_PAGE_SIZE) : 0;
+  if (watchlistPage !== nextPage) {
+    watchlistPage = nextPage; renderStockSelectors(); renderWatchlist(); restartWatchlistStream(); refreshPagePrices();
+  }
   $('symbol').value = selected.symbol;
   document.querySelectorAll('[data-stock]').forEach(button => { const active = button.dataset.stock === symbol; button.classList.toggle('selected', active); button.setAttribute('aria-pressed', String(active)); });
   currentBars = []; renderQuote(); renderChart();
   if (marketConnected || connected) loadSelected();
 }
 function renderWatchlist() {
+  renderPageControls();
   $('watchlist-count').textContent = STOCKS.length;
   const body = $('watchlist-body'); body.replaceChildren();
   if (!STOCKS.length) {
     const row = element('tr'), cell = element('td', 'Your watchlist is empty. Use Add stocks to start.'); cell.colSpan = 5; row.append(cell); body.append(row);
   }
-  STOCKS.forEach(stock => {
+  pageStocks().forEach(stock => {
     const quote = quotes[stock.symbol], row = element('tr'), asset = element('div', null, 'asset-cell');
     const name = element('div', null, 'asset-name'); name.append(element('strong', stock.symbol), element('small', stock.name));
     asset.append(element('span', stock.icon, 'asset-icon'), name);
@@ -325,7 +368,7 @@ async function startMarketStream() {
   const headers = {'Accept': 'text/event-stream'};
   if (apiToken) headers.Authorization = `Bearer ${apiToken}`;
   try {
-    const response = await fetch(`${apiBase}/api/market/stream?symbols=${encodeURIComponent(STOCKS.map(stock => stock.symbol).join(','))}`,  {headers, signal: controller.signal, cache: 'no-store', credentials: 'omit'});
+    const response = await fetch(`${apiBase}/api/market/stream?symbols=${encodeURIComponent(pageStocks().map(stock => stock.symbol).join(','))}`,  {headers, signal: controller.signal, cache: 'no-store', credentials: 'omit'});
     if (!response.ok || !(response.headers.get('content-type') || '').includes('text/event-stream') || !response.body) {
       if ([401, 403, 503].includes(response.status)) streamTerminal = true;
       throw new Error('Market stream unavailable. Check server credentials and feed permissions.');
@@ -396,7 +439,7 @@ async function refresh() {
       $('market-status').textContent = schedule?.schedule_available
         ? `${schedule.is_open ? 'Regular session open' : 'Regular session closed'} · provider schedule estimate`
         : 'Market data only · session status unavailable';
-      const quotesResult = await Promise.allSettled(STOCKS.map(async stock => {
+      const quotesResult = await Promise.allSettled(pageStocks().map(async stock => {
         const quote = await api(`/api/market/${stock.symbol}/quote`); saveSnapshot(stock.symbol, quote);
       }));
       renderWatchlist(); await loadSelected();
@@ -422,7 +465,7 @@ async function refresh() {
     else { lastRefresh = new Date().toISOString(); banner(`Connected to Alpaca paper trading · Updated ${time(lastRefresh)}. Quotes are timestamped; IEX covers one exchange. Streaming prices and chart updates use your selected market-data feed.`); }
     updateEstimate();
     if (connected) {
-      await Promise.allSettled(STOCKS.map(async stock => { try { saveSnapshot(stock.symbol, await api(`/api/market/${stock.symbol}/quote`)); } catch { /* Retain timestamped values until the next refresh or stream event. */ } }));
+      await Promise.allSettled(pageStocks().map(async stock => { try { saveSnapshot(stock.symbol, await api(`/api/market/${stock.symbol}/quote`)); } catch { /* Retain timestamped values until the next refresh or stream event. */ } }));
       renderWatchlist(); await loadSelected(); startMarketStream();
     }
   } catch (error) { connected = false; banner(error.message, true); }
@@ -430,11 +473,14 @@ async function refresh() {
 }
 
 function renderStockSelectors() {
+  renderPageControls();
   $('stock-tabs').replaceChildren(); $('symbol').replaceChildren();
-  STOCKS.forEach(stock => {
+  pageStocks().forEach(stock => {
     const tab = element('button', stock.symbol); tab.type = 'button'; tab.dataset.stock = stock.symbol;
     tab.classList.toggle('selected', stock.symbol === selected.symbol); tab.setAttribute('aria-pressed', String(stock.symbol === selected.symbol));
     tab.addEventListener('click', () => selectStock(stock.symbol)); $('stock-tabs').append(tab);
+  });
+  STOCKS.forEach(stock => {
     const option = element('option', `${stock.symbol} · ${stock.name}`); option.value = stock.symbol; $('symbol').append(option);
   });
   $('symbol').disabled = !STOCKS.length; $('symbol').value = STOCKS.length ? selected.symbol : '';
@@ -450,19 +496,23 @@ function restartWatchlistStream() {
 function addStock(value) {
   const stock = validStock(value);
   if (!stock || STOCKS.some(item => item.symbol === stock.symbol)) return;
-  if (STOCKS.length >= MAX_WATCHLIST) { $('stock-search-status').textContent = 'Your watchlist has 20 stocks. Remove one before adding another.'; return; }
-  STOCKS.push(stock); persistWatchlist(`Added ${stock.symbol}.`);
+  if (STOCKS.length >= MAX_WATCHLIST) { $('stock-search-status').textContent = `Your watchlist has ${MAX_WATCHLIST} listings. Remove one before adding another.`; return; }
+  const previousPage = watchlistPage;
+  STOCKS.push(stock); watchlistPage = Math.floor((STOCKS.length - 1) / WATCHLIST_PAGE_SIZE); persistWatchlist(`Added ${stock.symbol}.`);
   renderStockSelectors(); renderWatchlist(); selectStock(stock.symbol); renderSearchResults(); restartWatchlistStream();
+  if (previousPage !== watchlistPage) refreshPagePrices();
   $('stock-search-status').textContent = `Added ${stock.symbol}. ${STOCKS.length} of ${MAX_WATCHLIST} slots used.`;
 }
 function removeStock(symbol) {
   const index = STOCKS.findIndex(stock => stock.symbol === symbol);
   if (index < 0) return;
   STOCKS.splice(index, 1); delete quotes[symbol]; liveBars.delete(symbol); selectionEpoch++;
-  if (selected.symbol === symbol) selected = STOCKS[0] || DEFAULT_STOCKS[0];
+  renderPageControls();
+  if (selected.symbol === symbol) selected = pageStocks()[0] || DEFAULT_STOCKS[0];
   if (!STOCKS.length) { currentBars = []; quotes = {}; }
   renderStockSelectors(); renderWatchlist(); selectStock(selected.symbol); renderSearchResults();
   persistWatchlist(`Removed ${symbol}.`); restartWatchlistStream();
+  if (STOCKS.length > WATCHLIST_PAGE_SIZE) refreshPagePrices();
 }
 function renderSearchResults() {
   const root = $('stock-results'); root.replaceChildren();
@@ -472,7 +522,13 @@ function renderSearchResults() {
     const exists = STOCKS.some(item => item.symbol === stock.symbol);
     const button = element('button', exists ? 'Added' : 'Add', 'secondary-button'); button.type = 'button'; button.dataset.addStock = stock.symbol;
     button.disabled = exists || STOCKS.length >= MAX_WATCHLIST; button.setAttribute('aria-label', `${exists ? 'Already watching' : 'Add'} ${stock.symbol}`);
-    button.addEventListener('click', () => addStock(stock)); row.append(details, button); root.append(row);
+    button.addEventListener('click', () => addStock(stock));
+    const actions = element('div', null, 'stock-result-actions'); actions.append(button);
+    if (exists) {
+      const view = element('button', 'View', 'secondary-button'); view.type = 'button'; view.dataset.viewStock = stock.symbol;
+      view.addEventListener('click', () => { selectStock(stock.symbol); $('stock-dialog').close(); }); actions.append(view);
+    }
+    row.append(details, actions); root.append(row);
   });
 }
 async function searchStocks() {
@@ -493,6 +549,34 @@ async function searchStocks() {
     searchResults = []; renderSearchResults(); $('stock-search-status').textContent = error.message;
   } finally { if (epoch === searchEpoch) $('search-stocks').disabled = false; }
 }
+async function addSP500() {
+  if (bulkAdding) return;
+  bulkAdding = true; $('add-sp500').disabled = true; $('add-sp500-dialog').disabled = true;
+  $('watchlist-status').textContent = 'Loading S&P 500 company listings…';
+  $('stock-search-status').textContent = 'Loading S&P 500 company listings…';
+  try {
+    const data = await api('/api/stocks/sp500');
+    const incoming = (data.results || []).map(validStock).filter(Boolean);
+    const existing = new Set(STOCKS.map(stock => stock.symbol)), additions = [];
+    for (const stock of incoming) { if (!existing.has(stock.symbol)) { additions.push(stock); existing.add(stock.symbol); } }
+    if (incoming.length < 400 || incoming.length > 600) throw new Error('The membership list is incomplete. Your watchlist has not been changed.');
+    if (STOCKS.length + additions.length > MAX_WATCHLIST) throw new Error(`The complete list would exceed ${MAX_WATCHLIST} saved listings. Remove some stocks before adding the S&P 500.`);
+    STOCKS.push(...additions); watchlistPage = 0;
+    selected = pageStocks().some(stock => stock.symbol === selected.symbol) ? selected : pageStocks()[0];
+    selectionEpoch++; currentBars = [];
+    renderStockSelectors(); renderWatchlist(); renderSearchResults(); selectStock(selected.symbol); restartWatchlistStream();
+    persistWatchlist(`Added ${additions.length} S&P 500 listings; ${STOCKS.length} saved. Prices load ${WATCHLIST_PAGE_SIZE} per page.`);
+    $('stock-search-status').textContent = `${data.count} source listings · ${data.source} · fetched ${time(data.fetched_at)}. Multiple share classes can make the total exceed 500.`;
+    refreshPagePrices();
+  } catch (error) {
+    $('watchlist-status').textContent = error.message; $('stock-search-status').textContent = error.message;
+  } finally { bulkAdding = false; $('add-sp500').disabled = false; $('add-sp500-dialog').disabled = false; }
+}
+$('add-sp500').addEventListener('click', addSP500);
+$('add-sp500-dialog').addEventListener('click', addSP500);
+$('watchlist-prev').addEventListener('click', () => setWatchlistPage(watchlistPage - 1));
+$('watchlist-next').addEventListener('click', () => setWatchlistPage(watchlistPage + 1));
+$('watchlist-page-select').addEventListener('change', event => setWatchlistPage(event.target.value));
 $('open-stock-search').addEventListener('click', () => { $('stock-dialog').showModal(); $('stock-query').focus(); renderSearchResults(); });
 $('close-stock-search').addEventListener('click', () => $('stock-dialog').close());
 $('stock-dialog').addEventListener('close', () => { searchEpoch++; if (searchTimer) clearTimeout(searchTimer); searchTimer = null; $('search-stocks').disabled = false; });
