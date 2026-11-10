@@ -1,0 +1,115 @@
+const {test} = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const {parseHTML} = require('linkedom');
+const html = fs.readFileSync(`${__dirname}/../index.html`, 'utf8');
+const code = fs.readFileSync(`${__dirname}/../app.js`, 'utf8');
+const REVIEW_ID = 'e4de82d3-9e39-4c15-a435-de206852b186';
+const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(resolve => setImmediate(resolve)); };
+
+async function boot(options = {}) {
+  const {window, document} = parseHTML(html);
+  const $ = id => document.getElementById(id);
+  for (const [id, value] of [['symbol', 'AAPL'], ['order-type', 'market']]) Object.defineProperty($(id), 'value', {writable: true, value});
+  window.HTMLElement.prototype.showModal = function () { this.open = true; };
+  window.HTMLElement.prototype.close = function () { this.open = false; };
+  const saved = options.saved || new Map();
+  const storage = {getItem: key => saved.get(key) || null, setItem: (key, value) => saved.set(key, value)};
+  const calls = [];
+  let submitCount = 0;
+  const date = new Date().toISOString();
+  const fetch = async (url, init) => {
+    const path = new URL(url).pathname; calls.push({path, init});
+    let data;
+    if (options.offline) throw new TypeError('Failed to fetch');
+    if (path === '/api/account') data = {cash: '90000', equity: '100000', buying_power: '180000'};
+    else if (path === '/api/positions') data = [{symbol: 'AAPL', qty: '100', avg_entry_price: '90', current_price: '100', market_value: '10000', unrealized_pl: '1000'}];
+    else if (path === '/api/market/clock') data = {is_open: true, timestamp: date};
+    else if (path.endsWith('/quote')) data = {price: '100', timestamp: date, feed: 'iex', coverage: 'IEX exchange only', change_pct: '1.2', delayed: false};
+    else if (path.endsWith('/bars')) data = {bars: [{c: 99, t: date}, {c: 100, t: date}], delay_minutes: 16};
+    else if (path === '/api/risk') data = {max_position_pct: '20', max_order_notional: '5000', max_daily_loss: '1000', daily_loss: '0', basis: 'Previous close'};
+    else if (path === '/api/performance') data = {realized_pl: '200', unrealized_pl: '1000', fill_count: 3, realized_complete: true, method: 'Weighted-average fills', portfolio_history: {timestamp: [1, 2], equity: [99000, 100000]}};
+    else if (path === '/api/trades') data = {trades: []};
+    else if (path === '/api/orders/review') {
+      const draft = JSON.parse(init.body);
+      data = {review_id: REVIEW_ID, expires_at: Date.now() / 1000 + 60, order: draft, estimated_price: draft.limit_price || '100', estimated_total: '100', quote: {timestamp: date}};
+    } else if (path === '/api/orders' && init.method === 'POST') {
+      submitCount++;
+      if (options.submitTimeout) throw new TypeError('Connection interrupted after acceptance');
+      data = {id: 'broker-id', status: 'new', symbol: 'AAPL', qty: '1', side: 'buy'};
+    } else if (path.startsWith('/api/orders/by-review/')) data = {status: options.reconcileStatus || 'new'};
+    else if (path === '/api/orders') data = {orders: [], local: []};
+    else throw new Error(`Unexpected API ${path}`);
+    return new Response(JSON.stringify(data), {headers: {'Content-Type': 'application/json'}});
+  };
+  const context = vm.createContext({window, document, Node: window.Node, location: {origin: 'http://localhost:8000', hash: ''}, localStorage: storage, sessionStorage: storage, URL, AbortController, fetch, console, setTimeout, clearTimeout, setInterval: () => 0});
+  vm.runInContext(code, context);
+  await flush();
+  const click = async selector => { document.querySelector(selector).dispatchEvent(new window.Event('click')); await flush(); };
+  const submit = async id => { $(id).dispatchEvent(new window.Event('submit', {cancelable: true})); await flush(); };
+  return {$, click, submit, calls, saved, window, context, options, get submitCount() { return submitCount; }};
+}
+
+test('dashboard renders broker balances, timestamps, holdings and performance', async () => {
+  const app = await boot();
+  assert.equal(app.$('equity').textContent, '$100,000.00');
+  assert.equal(app.$('cash').textContent, '$90,000.00');
+  assert.match(app.$('holdings-content').textContent, /\$90.00/);
+  assert.equal(app.$('realized-pl').textContent, '$200.00');
+  assert.match(app.$('quote-time').textContent, /Latest trade/);
+  assert.equal(app.$('submit-order').disabled, false);
+  assert.ok(app.$('chart-line').getAttribute('d').startsWith('M'));
+});
+
+test('review is required before a single confirmed broker submission', async () => {
+  const app = await boot();
+  await app.submit('order-form');
+  assert.equal(app.submitCount, 0);
+  assert.equal(app.$('review-dialog').open, true);
+  assert.match(app.$('review-details').textContent, /AAPL/);
+  // Dispatch twice without waiting to exercise the double-click guard.
+  app.$('confirm-order').dispatchEvent(new app.window.Event('click'));
+  app.$('confirm-order').dispatchEvent(new app.window.Event('click'));
+  await flush();
+  assert.equal(app.submitCount, 1);
+  assert.equal(app.saved.get('trade-pending:http://localhost:8000'), '');
+  assert.match(app.$('order-message').textContent, /Paper order new/);
+});
+
+test('unknown order outcome survives reload and blocks replacements until reconciliation', async () => {
+  const app = await boot({submitTimeout: true});
+  await app.submit('order-form'); await app.click('#confirm-order');
+  assert.equal(app.saved.get('trade-pending:http://localhost:8000'), REVIEW_ID);
+  assert.equal(app.$('submit-order').disabled, true);
+  assert.match(app.$('activity-content').textContent, /Reconcile/);
+  const reloaded = await boot({saved: app.saved, reconcileStatus: 'unknown'});
+  assert.equal(reloaded.$('submit-order').disabled, true);
+  await reloaded.click('#activity-content button');
+  assert.equal(reloaded.saved.get('trade-pending:http://localhost:8000'), REVIEW_ID);
+  reloaded.options.reconcileStatus = 'new';
+  await reloaded.click('#activity-content button');
+  assert.equal(reloaded.saved.get('trade-pending:http://localhost:8000'), '');
+  assert.equal(reloaded.$('submit-order').disabled, false);
+});
+
+test('limit order form uses a whole-share step and includes the limit price', async () => {
+  const app = await boot();
+  app.$('order-type').value = 'limit';
+  app.$('order-type').dispatchEvent(new app.window.Event('change'));
+  app.$('limit-price').value = '98.50';
+  assert.equal(app.$('quantity').step, '1');
+  assert.equal(app.$('quantity').min, '1');
+  assert.equal(app.$('limit-price').required, true);
+  await app.submit('order-form');
+  const request = app.calls.find(item => item.path === '/api/orders/review');
+  assert.equal(JSON.parse(request.init.body).limit_price, '98.50');
+});
+
+test('API failure does not fall back to fake balances or enable trading', async () => {
+  const app = await boot({offline: true});
+  assert.equal(app.$('equity').textContent, '—');
+  assert.equal(app.$('submit-order').disabled, true);
+  assert.match(app.$('connection-status').textContent, /Failed to fetch/);
+  assert.equal(app.$('chart-line').getAttribute('d'), '');
+});

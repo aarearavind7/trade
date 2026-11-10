@@ -128,3 +128,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+# Durable local trading state (never commit account/order data)
+trading_app/data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+node_modules/

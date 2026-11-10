@@ -1,2 +1,4 @@
-# The demo uses Python's standard library and has no third-party runtime dependencies.
+fastapi==0.121.1
+uvicorn==0.38.0
+python-dotenv==1.2.1
 

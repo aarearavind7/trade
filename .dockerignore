@@ -1,0 +1,11 @@
+.git
+.env
+.venv
+**/__pycache__
+**/data
+**/node_modules
+web/tests
+web/package*.json
+trading_app/tests
+**/*.sqlite3*
+work

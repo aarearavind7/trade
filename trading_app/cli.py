@@ -23,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     order_parser.add_argument("qty", type=float)
     order_parser.add_argument("--type", default="market", dest="order_type")
     order_parser.add_argument("--time-in-force", default="day")
+    order_parser.add_argument("--limit-price", type=float)
     return parser
 
 
@@ -41,6 +42,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.qty,
                 order_type=args.order_type,
                 time_in_force=args.time_in_force,
+                limit_price=args.limit_price,
             )
         print(json.dumps(result, indent=2))
         return 0

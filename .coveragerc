@@ -1,0 +1,5 @@
+[run]
+omit = trading_app/tests/*
+
+[report]
+show_missing = True
