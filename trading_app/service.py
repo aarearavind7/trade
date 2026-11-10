@@ -123,6 +123,7 @@ class TradingService:
             raise TradeError('Market data has no valid timestamp.', 502) from exc
         previous = number((data.get('prevDailyBar') or {}).get('c') or 0)
         return {'symbol': symbol, 'price': str(price), 'timestamp': timestamp, 'age_seconds': round(age),
+                'previous_close': str(previous) if previous > 0 else None,
                 'change_pct': str((price / previous - 1) * 100) if previous > 0 else None,
                 'feed': self.broker.feed, 'delayed': self.broker.feed == 'delayed_sip' or age > self.limits.max_quote_age,
                 'coverage': 'IEX exchange only' if self.broker.feed == 'iex' else self.broker.feed.upper()}

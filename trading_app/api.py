@@ -1,6 +1,7 @@
 """FastAPI application. Run with uvicorn trading_app.api:app --host 127.0.0.1."""
 import hmac
 import os
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -9,7 +10,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -17,6 +18,7 @@ from typing import Literal
 
 from .alpaca_client import AlpacaClient, AlpacaError
 from .service import OrderDraft, OrderStore, RiskLimits, TradeError, TradingService, fill_performance
+from .market_stream import MarketStream, stream_events
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -34,7 +36,14 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         raise ValueError('Cross-origin hosting requires API_ACCESS_TOKEN and exact ALLOWED_ORIGINS (no wildcard).')
     limits = limits or RiskLimits(Decimal(os.getenv('MAX_POSITION_PCT', '20')), Decimal(os.getenv('MAX_ORDER_NOTIONAL', '5000')), Decimal(os.getenv('MAX_DAILY_LOSS', '1000')))
     store = OrderStore(db_path or os.getenv('TRADING_DB_PATH', str(ROOT / 'trading_app/data/orders.sqlite3')))
-    application = FastAPI(title='Trade Paper API', version='1.0.0', description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
+    @asynccontextmanager
+    async def lifespan(application):
+        yield
+        if application.state.market_stream is not None:
+            await application.state.market_stream.close()
+
+    application = FastAPI(title='Trade Paper API', version='1.1.0', lifespan=lifespan, description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
+    application.state.market_stream = None
     application.state.broker = broker
     application.state.store = store
     application.state.limits = limits
@@ -101,7 +110,8 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
     def health():
         configured_broker, setup_message = broker_configuration()
         return {'status': 'ok', 'mode': 'paper', 'authentication_required': bool(token),
-                'broker_configured': configured_broker is not None, 'setup_message': setup_message}
+                'broker_configured': configured_broker is not None, 'setup_message': setup_message,
+                'market_stream': True}
 
     @application.get('/favicon.ico', include_in_schema=False)
     def favicon():
@@ -120,6 +130,14 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
     @application.get('/api/market/clock')
     def clock(svc=Depends(service)):
         return svc.broker.clock()
+
+    @application.get('/api/market/stream')
+    async def market_stream(request: Request, svc=Depends(service)):
+        if application.state.market_stream is None:
+            application.state.market_stream = MarketStream(svc.broker)
+        return StreamingResponse(stream_events(application.state.market_stream, request),
+                                 media_type='text/event-stream',
+                                 headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})
 
     @application.get('/api/market/{symbol}/quote')
     def quote(symbol: str, svc=Depends(service)):

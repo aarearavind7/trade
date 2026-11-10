@@ -17,6 +17,9 @@ let apiToken = storage.get('trade-api-token', true);
 let selected = STOCKS[0], side = 'buy', range = '1D', review = null;
 let connected = false, refreshing = false, submitting = false, selectionEpoch = 0;
 let configurationBlocked = false;
+let streamSupported = false, streamController = null, streamRetryTimer = null, streamTerminal = false;
+let streamGeneration = 0, streamState = 'waiting', streamRetry = 1000, streamDetail = '';
+const liveBars = new Map();
 let account = null, clock = null, quotes = {}, currentBars = [], lastRefresh = null;
 let pendingReview = storage.get(`trade-pending:${apiBase}`);
 
@@ -84,6 +87,19 @@ function updateEstimate() {
   $('quantity').min = limit ? '1' : '0.000001';
   $('order-type-label').textContent = limit ? 'Limit · day' : 'Market · day';
 }
+function quoteDelayed(quote) {
+  return !!quote && (quote.delayed || quote.feed === 'delayed_sip' || Date.now() - new Date(quote.timestamp).getTime() > 120000);
+}
+function renderStreamStatus(detail) {
+  if (detail !== undefined) streamDetail = detail;
+  const quote = quotes[selected.symbol];
+  const delayed = quoteDelayed(quote);
+  const live = streamState === 'connected' && quote && !delayed;
+  $('stream-status').className = `stream-indicator ${live ? 'live' : delayed ? 'delayed' : 'offline'}`;
+  $('stream-status').textContent = streamDetail || (streamState === 'connected'
+    ? `${delayed ? 'Connected · delayed / stale trade' : quote ? 'Live market feed' : 'Connected · awaiting trades'} · ${quote?.coverage || 'Alpaca'}${clock?.is_open === false ? ' · market closed' : ''}`
+    : streamState === 'waiting' ? 'Market stream awaiting connection' : `${streamState === 'connecting' ? 'Connecting to market stream' : 'Market stream offline'} · REST refresh available`);
+}
 function renderQuote() {
   const quote = quotes[selected.symbol];
   $('quote-name').textContent = selected.name;
@@ -91,9 +107,9 @@ function renderQuote() {
   const change = quote?.change_pct == null ? null : Number(quote.change_pct);
   $('change').textContent = change == null ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`;
   $('change').className = change != null && change < 0 ? 'negative' : 'positive';
-  $('quote-time').textContent = quote ? `${quote.delayed ? 'Delayed / stale' : 'Latest trade'} · ${time(quote.timestamp)}` : 'No quote available';
+  $('quote-time').textContent = quote ? `${quoteDelayed(quote) ? 'Delayed / stale' : 'Latest trade'} · ${time(quote.timestamp)}` : 'No quote available';
   $('feed-label').textContent = quote ? `${quote.coverage} · ${quote.feed}` : 'Awaiting market data';
-  updateEstimate();
+  renderStreamStatus(); updateEstimate();
 }
 function linePath(values, width, height, padding = 12) {
   if (!values.length) return '';
@@ -107,7 +123,7 @@ function renderChart() {
   $('chart-area').setAttribute('d', values.length ? `${path} L760,240 L0,240 Z` : '');
   $('chart-empty').hidden = !!values.length;
   $('chart-empty').textContent = 'No historical bars available for this range.';
-  $('chart').setAttribute('aria-label', `${selected.name} ${range} historical price chart, delayed at least 16 minutes.`);
+  $('chart').setAttribute('aria-label', `${selected.name} ${range} price chart. Feed timestamps and delay status are shown below.`);
   $('axis-high').textContent = values.length ? Math.max(...values).toFixed(2) : '';
   $('axis-mid').textContent = values.length ? ((Math.max(...values) + Math.min(...values)) / 2).toFixed(2) : '';
   $('axis-low').textContent = values.length ? Math.min(...values).toFixed(2) : '';
@@ -118,11 +134,13 @@ async function loadSelected() {
   const epoch = ++selectionEpoch, symbol = selected.symbol, period = range;
   const results = await Promise.allSettled([api(`/api/market/${symbol}/quote`), api(`/api/market/${symbol}/bars?period=${period}`)]);
   if (epoch !== selectionEpoch) return;
-  if (results[0].status === 'fulfilled') quotes[symbol] = results[0].value;
-  else { delete quotes[symbol]; message(results[0].reason.message, true); }
+  if (results[0].status === 'fulfilled') saveSnapshot(symbol, results[0].value);
+  else { message(results[0].reason.message, true); }
   if (results[1].status === 'fulfilled') {
     currentBars = results[1].value.bars || [];
-    $('chart-data-note').textContent = `Historical bars · ≥${results[1].value.delay_minutes || 16} min delay${results[1].value.next_page_token ? ' · truncated' : ''}`;
+    if (period === '1D') mergeLiveBars(symbol);
+    const delay = results[1].value.delay_minutes || 0;
+    $('chart-data-note').textContent = `${delay ? `Historical bars · ≥${delay} min delay` : period === '1D' ? '1-minute bars · live trade updates' : 'Historical bars · current feed'}${results[1].value.next_page_token ? ' · truncated' : ''}`;
   } else { currentBars = []; $('chart-data-note').textContent = results[1].reason.message; }
   renderQuote(); renderChart(); renderWatchlist();
 }
@@ -141,7 +159,7 @@ function renderWatchlist() {
     asset.append(element('span', stock.icon, 'asset-icon'), name);
     const change = quote?.change_pct == null ? null : Number(quote.change_pct);
     const timestamp = element('span', quote ? new Date(quote.timestamp).toLocaleTimeString() : '—');
-    if (quote) timestamp.append(element('small', quote.delayed ? 'Delayed / stale' : quote.coverage, 'quote-state'));
+    if (quote) timestamp.append(element('small', quoteDelayed(quote) ? 'Delayed / stale' : quote.coverage, 'quote-state'));
     const action = element('button', '↗', 'trade-link'); action.type = 'button'; action.setAttribute('aria-label', `Trade ${stock.symbol}`);
     action.addEventListener('click', () => { selectStock(stock.symbol); $('order-form').scrollIntoView({behavior: 'smooth', block: 'center'}); $('quantity').focus({preventScroll: true}); });
     [asset, money(quote?.price), change == null ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`, timestamp, action].forEach((value, index) => {
@@ -207,14 +225,118 @@ async function reconcileOrder(id, button) {
   } catch (error) { message(error.message, true); }
   finally { if (button) button.disabled = false; }
 }
+function saveSnapshot(symbol, snapshot) {
+  const existing = quotes[symbol];
+  if (!existing || new Date(snapshot.timestamp) >= new Date(existing.timestamp)) quotes[symbol] = snapshot;
+  else if (snapshot.previous_close) {
+    existing.previous_close = snapshot.previous_close;
+    existing.change_pct = (Number(existing.price) / Number(snapshot.previous_close) - 1) * 100;
+  }
+}
+function mergeLiveBars(symbol) {
+  const merged = new Map(currentBars.map(bar => { const t = new Date(bar.t).toISOString(); return [t, {...bar, t}]; }));
+  const first = currentBars.length ? new Date(currentBars[0].t).getTime() : Date.now() - 86400000;
+  for (const bar of liveBars.get(symbol)?.values() || []) {
+    if (new Date(bar.t).getTime() >= first) merged.set(bar.t, bar);
+  }
+  currentBars = [...merged.values()].sort((a, b) => new Date(a.t) - new Date(b.t)).slice(-1500);
+}
+function rememberLiveBar(symbol, bar, source) {
+  const stamp = new Date(bar.t).getTime();
+  if (!Number.isFinite(stamp) || !Number.isFinite(Number(bar.c)) || Number(bar.c) <= 0) return;
+  const key = new Date(Math.floor(stamp / 60000) * 60000).toISOString();
+  if (!liveBars.has(symbol)) liveBars.set(symbol, new Map());
+  const cache = liveBars.get(symbol), old = cache.get(key);
+  // Completed/updated broker bars may correct the close; older trade ticks must not replace newer ticks.
+  if (source === 'trade' && old && old._tradeTime > stamp) return;
+  cache.set(key, {t: key, c: Number(bar.c), _tradeTime: source === 'trade' ? stamp : old?._tradeTime || stamp});
+  while (cache.size > 1500) cache.delete(cache.keys().next().value);
+  if (symbol === selected.symbol && range === '1D') { mergeLiveBars(symbol); renderChart(); }
+}
+function handleMarketEvent(event) {
+  if (event.type === 'status' || event.type === 'heartbeat') {
+    streamState = event.state;
+    if (event.retryable === false) streamTerminal = true;
+    renderStreamStatus(event.state === 'connected' ? '' : event.message);
+    return;
+  }
+  if (!STOCKS.some(stock => stock.symbol === event.symbol)) return;
+  if (event.type === 'quote') {
+    const old = quotes[event.symbol];
+    if (!Number.isFinite(Number(event.price)) || Number(event.price) <= 0 || !Number.isFinite(new Date(event.timestamp).getTime())) return;
+    if (old && new Date(event.timestamp) < new Date(old.timestamp)) return;
+    const previous = old?.previous_close || (old?.change_pct != null ? Number(old.price) / (1 + Number(old.change_pct) / 100) : null);
+    quotes[event.symbol] = {...event, previous_close: previous, change_pct: previous > 0 ? (Number(event.price) / Number(previous) - 1) * 100 : null};
+    rememberLiveBar(event.symbol, {t: event.timestamp, c: event.price}, 'trade');
+    if (event.symbol === selected.symbol) renderQuote();
+    renderWatchlist();
+  } else if (event.type === 'bar' && event.bar) {
+    rememberLiveBar(event.symbol, event.bar, 'bar');
+  }
+}
+function stopMarketStream() {
+  streamGeneration++;
+  if (streamRetryTimer) clearTimeout(streamRetryTimer);
+  streamRetryTimer = null;
+  if (streamController) streamController.abort();
+  streamController = null; streamState = 'waiting'; renderStreamStatus('');
+}
+async function startMarketStream() {
+  if (!streamSupported || !connected || configurationBlocked || streamTerminal || streamController || document.hidden) return;
+  const generation = ++streamGeneration, controller = new AbortController();
+  streamController = controller; streamState = 'connecting'; renderStreamStatus('');
+  const connectTimeout = setTimeout(() => controller.abort(), 15000);
+  let idleTimeout;
+  const headers = {'Accept': 'text/event-stream'};
+  if (apiToken) headers.Authorization = `Bearer ${apiToken}`;
+  try {
+    const response = await fetch(`${apiBase}/api/market/stream`, {headers, signal: controller.signal, cache: 'no-store', credentials: 'omit'});
+    if (!response.ok || !(response.headers.get('content-type') || '').includes('text/event-stream') || !response.body) {
+      if ([401, 403, 503].includes(response.status)) streamTerminal = true;
+      throw new Error('Market stream unavailable. Check server credentials and feed permissions.');
+    }
+    clearTimeout(connectTimeout);
+    idleTimeout = setTimeout(() => controller.abort(), 45000);
+    const reader = response.body.getReader(), decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (generation === streamGeneration) {
+        const {value, done} = await reader.read();
+        if (done || generation !== streamGeneration) break;
+        clearTimeout(idleTimeout); idleTimeout = setTimeout(() => controller.abort(), 45000);
+        buffer += decoder.decode(value, {stream: true});
+        if (buffer.length > 1048576) throw new Error('Invalid market stream frame.');
+        let boundary;
+        while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
+          const packet = buffer.slice(0, boundary.index); buffer = buffer.slice(boundary.index + boundary[0].length);
+          const data = packet.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
+          if (data) { handleMarketEvent(JSON.parse(data)); streamRetry = 1000; }
+        }
+      }
+    } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+  } catch (error) {
+    if (generation === streamGeneration && error.name !== 'AbortError') renderStreamStatus(error.message);
+  } finally {
+    clearTimeout(connectTimeout); clearTimeout(idleTimeout);
+    if (generation === streamGeneration) {
+      streamController = null; streamState = 'offline';
+      if (!streamTerminal) {
+        renderStreamStatus('Market stream disconnected · reconnecting; REST refresh remains available');
+        streamRetryTimer = setTimeout(() => { streamRetryTimer = null; startMarketStream(); }, streamRetry);
+        streamRetry = Math.min(streamRetry * 2, 30000);
+      }
+    }
+  }
+}
 async function refresh() {
   if (refreshing || submitting) return;
   refreshing = true; $('refresh-data').disabled = true;
   try {
     const health = await api('/api/health');
     configurationBlocked = health.broker_configured === false;
+    streamSupported = health.market_stream === true;
     if (configurationBlocked) {
-      connected = false; quotes = {}; currentBars = [];
+      connected = false; quotes = {}; currentBars = []; stopMarketStream();
       $('market-status').textContent = 'Alpaca setup required';
       banner(health.setup_message || 'Configure Alpaca paper keys in the server .env file, restart Uvicorn, then click Refresh.', true);
       renderQuote(); renderChart(); renderWatchlist();
@@ -235,11 +357,11 @@ async function refresh() {
     if (results[6].status === 'fulfilled') $('trades-content').replaceChildren(table(['Time', 'Asset', 'Side', 'Filled shares', 'Fill price', 'Value'], results[6].value.trades.map(fill => [time(fill.transaction_time), fill.symbol, fill.side, quantity(fill.qty), money(fill.price), money(Number(fill.qty) * Number(fill.price))]), 'No fills in this paper account.'));
     const failures = results.filter(result => result.status === 'rejected');
     if (failures.length) banner(`${failures[0].reason.message}${lastRefresh ? ` Last complete refresh: ${time(lastRefresh)}. Previously displayed values may be stale.` : ''}`, true);
-    else { lastRefresh = new Date().toISOString(); banner(`Connected to Alpaca paper trading · Updated ${time(lastRefresh)}. Quotes are timestamped; IEX covers one exchange. Historical bars are delayed at least 16 minutes.`); }
+    else { lastRefresh = new Date().toISOString(); banner(`Connected to Alpaca paper trading · Updated ${time(lastRefresh)}. Quotes are timestamped; IEX covers one exchange. Streaming prices and chart updates use your selected market-data feed.`); }
     updateEstimate();
     if (connected) {
-      await Promise.allSettled(STOCKS.map(async stock => { try { quotes[stock.symbol] = await api(`/api/market/${stock.symbol}/quote`); } catch { delete quotes[stock.symbol]; } }));
-      renderWatchlist(); await loadSelected();
+      await Promise.allSettled(STOCKS.map(async stock => { try { saveSnapshot(stock.symbol, await api(`/api/market/${stock.symbol}/quote`)); } catch { /* Retain timestamped values until the next refresh or stream event. */ } }));
+      renderWatchlist(); await loadSelected(); startMarketStream();
     }
   } catch (error) { connected = false; banner(error.message, true); }
   finally { refreshing = false; $('refresh-data').disabled = false; updateEstimate(); }
@@ -297,6 +419,7 @@ $('connection-form').addEventListener('submit', async event => {
     const url = new URL($('api-url').value);
     if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Enter only the API origin, without credentials, paths, or query parameters.');
     if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) throw new Error('Use HTTPS for remote APIs. HTTP is supported only on localhost.');
+    stopMarketStream(); streamTerminal = false; liveBars.clear();
     apiBase = url.origin; apiToken = $('api-token').value.trim(); quotes = {}; account = null; connected = false;
     lastRefresh = null; currentBars = [];
     ['equity', 'cash', 'invested', 'buying-power', 'realized-pl', 'unrealized-pl', 'fill-count'].forEach(id => { $(id).textContent = '—'; });
@@ -307,7 +430,7 @@ $('connection-form').addEventListener('submit', async event => {
     $('connection-dialog').close(); renderWatchlist(); renderQuote(); await refresh();
   } catch (error) { $('connection-error').textContent = error.message; }
 });
-$('refresh-data').addEventListener('click', refresh);
+$('refresh-data').addEventListener('click', () => { streamTerminal = false; if (streamRetryTimer) { clearTimeout(streamRetryTimer); streamRetryTimer = null; } refresh(); });
 function updateNavigation() {
   const hash = location.hash || '#overview';
   document.querySelectorAll('.nav-link').forEach(link => { const active = link.hash === hash; link.classList.toggle('active', active); if (active) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); });
@@ -316,3 +439,7 @@ function updateNavigation() {
 window.addEventListener('hashchange', updateNavigation);
 selectStock(selected.symbol); renderWatchlist(); updateNavigation(); refresh();
 setInterval(() => { if (!configurationBlocked && !document.hidden && !$('review-dialog').open && !$('connection-dialog').open) refresh(); }, 30000);
+
+window.addEventListener('pagehide', stopMarketStream);
+document.addEventListener('visibilitychange', () => { if (document.hidden) stopMarketStream(); else refresh(); });
+setInterval(() => { renderQuote(); renderWatchlist(); }, 5000);

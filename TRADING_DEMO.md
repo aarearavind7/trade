@@ -39,8 +39,12 @@ Never post `.env` or your keys in chat, screenshots, GitHub issues, or commits. 
 - `ALPACA_DATA_FEED=iex` is the default. It provides exchange-specific IEX data, not the consolidated US market. Quote timestamps, feed coverage, and market open/closed status are visible.
 - `sip` requires the corresponding Alpaca data entitlement. `delayed_sip` is an explicitly delayed feed.
 - A quote older than 120 seconds is marked delayed/stale. Orders are blocked during an open session when the reference quote is stale; use a current entitled feed for trading.
-- Historical stock bars deliberately end **16 minutes before the request time** so free historical-data entitlements can work. Charts label this delay and display empty states instead of invented trends. No bars may be returned overnight, on holidays, or over a weekend for the 1D range; choose 1W or longer.
-- The dashboard refreshes every 30 seconds while visible. It polls the API, not a streaming feed. Partial failures display a warning; previously shown values may be stale.
+- IEX and entitled SIP historical requests now end at the current time; the previous fixed 16-minute delay is removed for these feeds. `delayed_sip` history keeps a labelled 16-minute delay. No bars may be returned overnight, on holidays, or over a weekend for the 1D range; choose 1W or longer.
+- The backend authenticates to Alpaca's stock-market WebSocket at `wss://stream.data.alpaca.markets/v2/<feed>` and subscribes to trades, minute bars, and corrected bars for AAPL, MSFT, NVDA, GOOGL, and TSLA. One connection per Python process is shared across browser tabs. Alpaca credentials never reach the browser.
+- Authenticated server-sent events (`GET /api/market/stream`) update watchlist prices, the selected price, and the order estimate as trades arrive. The **1D chart** updates its current minute from trades and accepts completed/corrected one-minute broker bars. Current-minute points are provisional until the broker completes that bar. Longer ranges use refreshed historical bars.
+- A connection indicator shows live, delayed/stale, connecting, reconnecting, or unavailable. It never fabricates trades when a market is closed or a symbol is inactive. IEX only covers IEX trades, so it may update less frequently than consolidated SIP.
+- Transport interruptions reconnect with a capped backoff. Permission, authentication, or subscription-limit denials stop automatic stream retries and show an actionable message; fix the cause and click **Refresh**. The browser cancels streams when hidden and reconnects when visible. REST account/history refresh continues every 30 seconds as a fallback; quote freshness is checked every five seconds.
+- Browser SSE uses `fetch` with an `Authorization` header when an app token is configured; tokens are never placed in stream URLs. Idle heartbeats detect lost connections. Slow browsers use bounded queues and may skip intermediate ticks; this is a charting UI, not a tick archive. Partial failures display a warning; previously shown values may be stale.
 
 ## Orders and recovery
 
@@ -83,6 +87,7 @@ Realized P/L uses **weighted-average cost accounting for long-only fills**, excl
 | GET | `/api/account` | Paper-account balances and status. |
 | GET | `/api/positions` | Broker positions, average cost, unrealized P/L. |
 | GET | `/api/market/clock` | Exchange clock and next open/close. |
+| GET | `/api/market/stream` | Authenticated SSE prices, minute bars, feed/connection status, and heartbeats. |
 | GET | `/api/market/{symbol}/quote` | Latest trade, timestamp, age, feed and delay label. |
 | GET | `/api/market/{symbol}/bars?period=1D` | Historical bars; also `1W`, `1M`, `1Y`. |
 | POST | `/api/orders/review` | Validate a draft and create a 60-second review. |
@@ -112,7 +117,8 @@ Before exposing the backend:
 - Set `ALLOWED_HOSTS` to the API hostname (without a scheme or port), plus localhost if needed. Use HTTPS at the host's ingress.
 - For the existing hosted frontend, set `ALLOWED_ORIGINS=https://trade-practice-aarearavind.lendtrace-9126.chatgpt.site`. CORS configuration requires a token and exact origins; wildcards are rejected.
 - Attach persistent writable storage for `TRADING_DB_PATH`. Keep one app instance/storage volume, or workers on the same local filesystem. Separate replicas with separate SQLite databases are unsupported.
-- Run `uvicorn trading_app.api:app --host 0.0.0.0 --port 8000 --no-proxy-headers`. Keeping proxy-header trust disabled prevents forwarded addresses from being treated as localhost.
+- Run one Uvicorn worker for streaming (Alpaca free feeds commonly allow only one upstream market-data connection per account). Close other running Alpaca stream clients if subscription is denied. Multiple tabs share the worker connection. Configure proxies to allow long-lived SSE responses without buffering, with an idle timeout above the 15-second heartbeat.
+- Run `uvicorn trading_app.api:app --host 0.0.0.0 --port 8000 --no-proxy-headers --timeout-graceful-shutdown 5`. Keeping proxy-header trust disabled prevents forwarded addresses from being treated as localhost.
 
 A container definition is included:
 
@@ -133,7 +139,7 @@ npm ci --prefix web
 npm test --prefix web
 ```
 
-Tests use mocked broker responses and browser DOM/network adapters; they never contact Alpaca. They cover order validation, duplicate/concurrent submissions, crash and timeout recovery, risk reservations, quote staleness, API authorization/failures, fill accounting, review/confirmation, and browser recovery after uncertain submissions.
+Tests use mocked broker responses and browser DOM/network adapters; they never contact Alpaca. They cover order validation, duplicate/concurrent submissions, crash and timeout recovery, risk reservations, quote staleness, API authorization/failures, fill accounting, review/confirmation, browser recovery after uncertain submissions, shared stream connections, reconnection/denials, fragmented SSE parsing, and stale snapshot protection.
 
 `.github/workflows/trading-tests.yml` runs the Python suite on 3.11, 3.12, and 3.13 with an 80% coverage floor, checks JavaScript syntax, and runs dashboard tests. Existing repository-validation workflows remain in place. DOM tests do not replace full visual browser testing or an integration check with your own paper account.
 

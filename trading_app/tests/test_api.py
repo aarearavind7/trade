@@ -257,12 +257,20 @@ def test_concurrent_duplicate_submit_and_process_restart(tmp_path, broker):
     path = tmp_path / 'durable.sqlite3'
     svc = TradingService(broker, OrderStore(path))
     review = svc.review(OrderDraft(**DRAFT))
-    def submit(_): return TradingService(broker, OrderStore(path)).submit(review['review_id'])
+    def submit(_):
+        try:
+            return TradingService(broker, OrderStore(path)).submit(review['review_id'])
+        except TradeError as exc:
+            # A duplicate can observe persisted intent before the first request reaches
+            # the broker. It must be blocked, then resolve to that same order later.
+            assert exc.status == 409 and 'unknown' in exc.message
+            return None
     with ThreadPoolExecutor(max_workers=4) as pool:
         orders = list(pool.map(submit, range(4)))
-    assert len({order['id'] for order in orders}) == 1
+    completed = [order for order in orders if order is not None]
+    assert len({order['id'] for order in completed}) == 1
     assert broker.submissions == 1
-    assert TradingService(broker, OrderStore(path)).submit(review['review_id'])['id'] == orders[0]['id']
+    assert TradingService(broker, OrderStore(path)).submit(review['review_id'])['id'] == completed[0]['id']
 
 
 def test_crash_after_persisted_intent_does_not_resubmit(tmp_path, broker):
@@ -354,3 +362,25 @@ def test_health_reports_invalid_endpoint_without_disclosing_credentials(tmp_path
         assert not response.json()['broker_configured']
         assert 'official Alpaca paper-trading' in response.json()['setup_message']
         assert 'unit-test-secret' not in response.text
+
+
+def test_stream_requires_application_token(tmp_path, broker):
+    app = create_app(broker, tmp_path / 'stream-auth.sqlite3', access_token='stream-app-token', allowed_origins=[])
+    with TestClient(app) as client:
+        assert client.get('/api/market/stream').status_code == 401
+        assert app.state.market_stream is None
+
+
+def test_sse_endpoint_content_type_and_auth_header(tmp_path, broker, monkeypatch):
+    import trading_app.api as api
+    app = create_app(broker, tmp_path / 'stream.sqlite3', access_token='stream-app-token', allowed_origins=[])
+    async def finite_events(hub, request):
+        yield 'data: {"type":"status","state":"connected"}\n\n'
+    monkeypatch.setattr(api, 'stream_events', finite_events)
+    with TestClient(app) as client:
+        result = client.get('/api/market/stream', headers={'Authorization': 'Bearer stream-app-token'})
+        assert result.status_code == 200
+        assert result.headers['content-type'].startswith('text/event-stream')
+        assert result.headers['x-accel-buffering'] == 'no'
+        assert 'connected' in result.text
+        assert 'stream-app-token' not in result.text

@@ -111,15 +111,15 @@ class AlpacaClient:
         return self._request('GET', self.data_url + '/v2/stocks/' + symbol + '/snapshot', params={'feed': self.feed})
 
     def bars(self, symbol, period='1D'):
-        days, timeframe = {'1D': (1, '5Min'), '1W': (7, '1Hour'), '1M': (31, '1Day'), '1Y': (366, '1Day')}[period]
-        # End 16 minutes ago so historical requests also work with free data entitlements.
-        end = datetime.now(timezone.utc) - timedelta(minutes=16)
+        days, timeframe = {'1D': (1, '1Min'), '1W': (7, '1Hour'), '1M': (31, '1Day'), '1Y': (366, '1Day')}[period]
+        delay = 16 if self.feed == 'delayed_sip' else 0
+        end = datetime.now(timezone.utc) - timedelta(minutes=delay)
         start = end - timedelta(days=days)
         params = {'timeframe': timeframe, 'start': start.isoformat(), 'end': end.isoformat(),
                   'feed': self.feed, 'adjustment': 'all', 'limit': 10000, 'sort': 'asc'}
         result = self._request('GET', self.data_url + '/v2/stocks/' + quote(self.symbol(symbol), safe='') + '/bars', params=params)
-        return {'bars': result.get('bars') or [], 'feed': self.feed, 'delayed': True,
-                'delay_minutes': 16, 'next_page_token': result.get('next_page_token')}
+        return {'bars': result.get('bars') or [], 'feed': self.feed, 'delayed': bool(delay),
+                'delay_minutes': delay, 'timeframe': timeframe, 'next_page_token': result.get('next_page_token')}
 
     def orders(self, status='all'):
         return self._request('GET', self.trading_url + '/v2/orders', params={'status': status, 'limit': 500, 'direction': 'desc', 'nested': 'false'})

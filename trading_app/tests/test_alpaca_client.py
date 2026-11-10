@@ -186,3 +186,18 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual('test-key', client.api_key)
         self.assertEqual('test-secret', client.secret_key)
         self.assertEqual('https://paper-api.alpaca.markets', client.trading_url)
+
+
+class HistoricalFeedTests(unittest.TestCase):
+    def test_real_time_feed_has_no_artificial_chart_delay(self):
+        from datetime import datetime, timezone
+        session = FakeSession(FakeResponse(payload={'bars': []}))
+        client = AlpacaClient(api_key='test-key', secret_key='test-secret', session=session)
+        result = client.bars('AAPL', '1D')
+        assert result['delay_minutes'] == 0 and not result['delayed']
+        params = session.calls[-1][2]['params']
+        assert params['timeframe'] == '1Min'
+        assert (datetime.now(timezone.utc) - datetime.fromisoformat(params['end'])).total_seconds() < 10
+        client.feed = 'delayed_sip'
+        result = client.bars('AAPL', '1D')
+        assert result['delay_minutes'] == 16 and result['delayed']
