@@ -99,7 +99,7 @@ __pypackages__/
 celerybeat-schedule
 celerybeat.pid
 
-# SageMath
+# SageMath parsed files
 *.sage.py
 
 # Environments
@@ -126,5 +126,5 @@ venv.bak/
 .dmypy.json
 dmypy.json
 
-# Pyre
+# Pyre type checker
 .pyre/
