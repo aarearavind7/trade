@@ -1,6 +1,6 @@
 'use strict';
 
-const STOCKS = [
+const DEFAULT_STOCKS = [
   {symbol: 'AAPL', name: 'Apple Inc.', icon: 'A'},
   {symbol: 'MSFT', name: 'Microsoft Corp.', icon: '▦'},
   {symbol: 'NVDA', name: 'NVIDIA Corp.', icon: 'N'},
@@ -11,10 +11,30 @@ const $ = id => document.getElementById(id);
 const money = value => value == null || !Number.isFinite(Number(value)) ? '—' : new Intl.NumberFormat('en-US', {style: 'currency', currency: 'USD'}).format(Number(value));
 const quantity = value => new Intl.NumberFormat('en-US', {maximumFractionDigits: 6}).format(Number(value));
 const time = value => value ? new Date(value).toLocaleString() : 'Unavailable';
-const storage = {get(key, session = false) { try { return (session ? sessionStorage : localStorage).getItem(key) || ''; } catch { return ''; } }, set(key, value, session = false) { try { (session ? sessionStorage : localStorage).setItem(key, value); } catch { /* API still maintains durable order state. */ } }};
+const storage = {get(key, session = false) { try { return (session ? sessionStorage : localStorage).getItem(key) || ''; } catch { return ''; } }, set(key, value, session = false) { try { (session ? sessionStorage : localStorage).setItem(key, value); return true; } catch { return false; } }};
+const WATCHLIST_KEY = 'trade-watchlist-v1';
+const MAX_WATCHLIST = 20;
+function validStock(value) {
+  if (!value || typeof value.symbol !== 'string') return null;
+  const symbol = value.symbol.trim().toUpperCase();
+  if (!/^[A-Z][A-Z0-9.\-]{0,9}$/.test(symbol)) return null;
+  return {symbol, name: typeof value.name === 'string' && value.name.trim() ? value.name.trim().slice(0, 200) : symbol, icon: symbol[0]};
+}
+function loadWatchlist() {
+  try {
+    const raw = storage.get(WATCHLIST_KEY);
+    if (!raw) return DEFAULT_STOCKS.map(stock => ({...stock}));
+    const rows = JSON.parse(raw);
+    if (!Array.isArray(rows)) throw new Error('Invalid watchlist');
+    const seen = new Set();
+    return rows.map(validStock).filter(stock => stock && !seen.has(stock.symbol) && seen.add(stock.symbol)).slice(0, MAX_WATCHLIST);
+  } catch { return DEFAULT_STOCKS.map(stock => ({...stock})); }
+}
+const STOCKS = loadWatchlist();
+let searchEpoch = 0, searchTimer = null, searchResults = [];
 let apiBase = storage.get('trade-api-base') || location.origin;
 let apiToken = storage.get('trade-api-token', true);
-let selected = STOCKS[0], side = 'buy', range = '1D', review = null;
+let selected = STOCKS[0] || DEFAULT_STOCKS[0], side = 'buy', range = '1D', review = null;
 let connected = false, refreshing = false, submitting = false, selectionEpoch = 0;
 let configurationBlocked = false, publicMarketMode = false, marketConnected = false;
 let connectionChecking = false, lastConnectionCheck = null;
@@ -51,7 +71,7 @@ async function api(path, {method = 'GET', body, base = apiBase, accessToken = ap
   const timer = setTimeout(() => controller.abort(), method === 'POST' ? 60000 : 30000);
   try {
     const response = await fetch(`${base}${path}`, {method, headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: 'omit'});
-    if (!(response.headers.get('content-type') || '').includes('application/json')) throw new Error('No trading API at this address. Use Connect API to enter your FastAPI server URL.');
+    if (!(response.headers.get('content-type') || '').includes('application/json')) throw new Error('No trading API at this address. Use Connection setup to enter your FastAPI server URL.');
     const data = await response.json();
     if (!response.ok) {
       const detail = Array.isArray(data.detail) ? data.detail.map(error => error.msg).join('; ') : data.detail;
@@ -81,7 +101,7 @@ function updateEstimate() {
   $('order-price').textContent = money(quotes[selected.symbol]?.price);
   $('estimate').textContent = price > 0 && qty > 0 ? money(price * qty) : '—';
   $('submit-order').replaceChildren(document.createTextNode(`Review ${side} ${selected.symbol}`), element('span', '↗'));
-  $('submit-order').disabled = !connected || submitting || !!pendingReview || !quotes[selected.symbol];
+  $('submit-order').disabled = !STOCKS.length || !connected || submitting || !!pendingReview || !quotes[selected.symbol];
   $('limit-field').hidden = !limit;
   $('limit-price').required = limit;
   $('quantity').step = limit ? '1' : '0.000001';
@@ -108,7 +128,7 @@ function renderStreamStatus(detail) {
 }
 function renderQuote() {
   const quote = quotes[selected.symbol];
-  $('quote-name').textContent = selected.name;
+  $('quote-name').textContent = STOCKS.length ? selected.name : 'Add a stock to start exploring';
   $('price').textContent = money(quote?.price);
   const change = quote?.change_pct == null ? null : Number(quote.change_pct);
   $('change').textContent = change == null ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`;
@@ -128,7 +148,7 @@ function renderChart() {
   $('chart-line').setAttribute('d', path);
   $('chart-area').setAttribute('d', values.length ? `${path} L760,240 L0,240 Z` : '');
   $('chart-empty').hidden = !!values.length;
-  $('chart-empty').textContent = 'No historical bars available for this range.';
+  $('chart-empty').textContent = STOCKS.length ? 'No historical bars available for this range.' : 'Your watchlist is empty. Add a stock to see its chart.';
   $('chart').setAttribute('aria-label', `${selected.name} ${range} price chart. Feed timestamps and delay status are shown below.`);
   $('axis-high').textContent = values.length ? Math.max(...values).toFixed(2) : '';
   $('axis-mid').textContent = values.length ? ((Math.max(...values) + Math.min(...values)) / 2).toFixed(2) : '';
@@ -137,6 +157,7 @@ function renderChart() {
   $('chart-times').replaceChildren(...marks.map(index => element('span', new Date(valid[index].t).toLocaleString(undefined, range === '1D' ? {hour: 'numeric', minute: '2-digit'} : {month: 'short', day: 'numeric'}))));
 }
 async function loadSelected() {
+  if (!STOCKS.some(stock => stock.symbol === selected.symbol)) return;
   const epoch = ++selectionEpoch, symbol = selected.symbol, period = range;
   const results = await Promise.allSettled([api(`/api/market/${symbol}/quote`), api(`/api/market/${symbol}/bars?period=${period}`)]);
   if (epoch !== selectionEpoch) return;
@@ -151,14 +172,18 @@ async function loadSelected() {
   renderQuote(); renderChart(); renderWatchlist();
 }
 function selectStock(symbol) {
-  selected = STOCKS.find(stock => stock.symbol === symbol) || STOCKS[0];
+  selected = STOCKS.find(stock => stock.symbol === symbol) || STOCKS[0] || DEFAULT_STOCKS[0];
   $('symbol').value = selected.symbol;
   document.querySelectorAll('[data-stock]').forEach(button => { const active = button.dataset.stock === symbol; button.classList.toggle('selected', active); button.setAttribute('aria-pressed', String(active)); });
   currentBars = []; renderQuote(); renderChart();
   if (marketConnected || connected) loadSelected();
 }
 function renderWatchlist() {
+  $('watchlist-count').textContent = STOCKS.length;
   const body = $('watchlist-body'); body.replaceChildren();
+  if (!STOCKS.length) {
+    const row = element('tr'), cell = element('td', 'Your watchlist is empty. Use Add stocks to start.'); cell.colSpan = 5; row.append(cell); body.append(row);
+  }
   STOCKS.forEach(stock => {
     const quote = quotes[stock.symbol], row = element('tr'), asset = element('div', null, 'asset-cell');
     const name = element('div', null, 'asset-name'); name.append(element('strong', stock.symbol), element('small', stock.name));
@@ -168,7 +193,10 @@ function renderWatchlist() {
     if (quote) timestamp.append(element('small', quote.timing_verified === false ? 'May be delayed' : quoteDelayed(quote) ? 'Delayed / stale' : quote.coverage, 'quote-state'));
     const action = element('button', '↗', 'trade-link'); action.type = 'button'; action.setAttribute('aria-label', `Trade ${stock.symbol}`);
     action.addEventListener('click', () => { selectStock(stock.symbol); $('order-form').scrollIntoView({behavior: 'smooth', block: 'center'}); $('quantity').focus({preventScroll: true}); });
-    [asset, money(quote?.price), change == null ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`, timestamp, action].forEach((value, index) => {
+    const actions = element('div', null, 'watchlist-actions');
+    const remove = element('button', '×', 'remove-stock'); remove.type = 'button'; remove.setAttribute('aria-label', `Remove ${stock.symbol} from watchlist`); remove.dataset.removeStock = stock.symbol;
+    remove.addEventListener('click', () => removeStock(stock.symbol)); actions.append(action, remove);
+    [asset, money(quote?.price), change == null ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`, timestamp, actions].forEach((value, index) => {
       const cell = element('td'); if (value instanceof Node) cell.append(value); else cell.textContent = value;
       if (index === 2) cell.className = change != null && change < 0 ? 'negative' : 'positive';
       if (index === 3) cell.className = 'spark-col'; row.append(cell);
@@ -232,6 +260,7 @@ async function reconcileOrder(id, button) {
   finally { if (button) button.disabled = false; }
 }
 function saveSnapshot(symbol, snapshot) {
+  if (!STOCKS.some(stock => stock.symbol === symbol)) return;
   const existing = quotes[symbol];
   if (!existing || new Date(snapshot.timestamp) >= new Date(existing.timestamp)) quotes[symbol] = snapshot;
   else if (snapshot.previous_close) {
@@ -288,7 +317,7 @@ function stopMarketStream() {
   streamController = null; streamState = 'waiting'; renderStreamStatus('');
 }
 async function startMarketStream() {
-  if (!streamSupported || !connected || configurationBlocked || streamTerminal || streamController || document.hidden) return;
+  if (!STOCKS.length || !streamSupported || !connected || configurationBlocked || streamTerminal || streamController || document.hidden) return;
   const generation = ++streamGeneration, controller = new AbortController();
   streamController = controller; streamState = 'connecting'; renderStreamStatus('');
   const connectTimeout = setTimeout(() => controller.abort(), 15000);
@@ -296,7 +325,7 @@ async function startMarketStream() {
   const headers = {'Accept': 'text/event-stream'};
   if (apiToken) headers.Authorization = `Bearer ${apiToken}`;
   try {
-    const response = await fetch(`${apiBase}/api/market/stream`, {headers, signal: controller.signal, cache: 'no-store', credentials: 'omit'});
+    const response = await fetch(`${apiBase}/api/market/stream?symbols=${encodeURIComponent(STOCKS.map(stock => stock.symbol).join(','))}`,  {headers, signal: controller.signal, cache: 'no-store', credentials: 'omit'});
     if (!response.ok || !(response.headers.get('content-type') || '').includes('text/event-stream') || !response.body) {
       if ([401, 403, 503].includes(response.status)) streamTerminal = true;
       throw new Error('Market stream unavailable. Check server credentials and feed permissions.');
@@ -371,7 +400,7 @@ async function refresh() {
         const quote = await api(`/api/market/${stock.symbol}/quote`); saveSnapshot(stock.symbol, quote);
       }));
       renderWatchlist(); await loadSelected();
-      if (quotesResult.every(result => result.status === 'rejected')) throw quotesResult[0].reason;
+      if (quotesResult.length && quotesResult.every(result => result.status === 'rejected')) throw quotesResult[0].reason;
       return;
     }
     const results = await Promise.allSettled([api('/api/account'), api('/api/positions'), api('/api/market/clock'), api('/api/orders'), api('/api/risk'), api('/api/performance'), api('/api/trades')]);
@@ -400,10 +429,80 @@ async function refresh() {
   finally { refreshing = false; $('refresh-data').disabled = false; $('refresh-market').disabled = false; updateEstimate(); }
 }
 
-STOCKS.forEach(stock => {
-  const tab = element('button', stock.symbol); tab.type = 'button'; tab.dataset.stock = stock.symbol; tab.addEventListener('click', () => selectStock(stock.symbol)); $('stock-tabs').append(tab);
-  const option = element('option', `${stock.symbol} · ${stock.name}`); option.value = stock.symbol; $('symbol').append(option);
+function renderStockSelectors() {
+  $('stock-tabs').replaceChildren(); $('symbol').replaceChildren();
+  STOCKS.forEach(stock => {
+    const tab = element('button', stock.symbol); tab.type = 'button'; tab.dataset.stock = stock.symbol;
+    tab.classList.toggle('selected', stock.symbol === selected.symbol); tab.setAttribute('aria-pressed', String(stock.symbol === selected.symbol));
+    tab.addEventListener('click', () => selectStock(stock.symbol)); $('stock-tabs').append(tab);
+    const option = element('option', `${stock.symbol} · ${stock.name}`); option.value = stock.symbol; $('symbol').append(option);
+  });
+  $('symbol').disabled = !STOCKS.length; $('symbol').value = STOCKS.length ? selected.symbol : '';
+}
+function persistWatchlist(action) {
+  const saved = storage.set(WATCHLIST_KEY, JSON.stringify(STOCKS.map(({symbol, name}) => ({symbol, name}))));
+  $('watchlist-status').textContent = `${action} ${saved ? 'Saved in this browser.' : 'Browser storage is unavailable; changes last only for this session.'}`;
+}
+function restartWatchlistStream() {
+  stopMarketStream(); streamTerminal = false;
+  if (connected && STOCKS.length) startMarketStream();
+}
+function addStock(value) {
+  const stock = validStock(value);
+  if (!stock || STOCKS.some(item => item.symbol === stock.symbol)) return;
+  if (STOCKS.length >= MAX_WATCHLIST) { $('stock-search-status').textContent = 'Your watchlist has 20 stocks. Remove one before adding another.'; return; }
+  STOCKS.push(stock); persistWatchlist(`Added ${stock.symbol}.`);
+  renderStockSelectors(); renderWatchlist(); selectStock(stock.symbol); renderSearchResults(); restartWatchlistStream();
+  $('stock-search-status').textContent = `Added ${stock.symbol}. ${STOCKS.length} of ${MAX_WATCHLIST} slots used.`;
+}
+function removeStock(symbol) {
+  const index = STOCKS.findIndex(stock => stock.symbol === symbol);
+  if (index < 0) return;
+  STOCKS.splice(index, 1); delete quotes[symbol]; liveBars.delete(symbol); selectionEpoch++;
+  if (selected.symbol === symbol) selected = STOCKS[0] || DEFAULT_STOCKS[0];
+  if (!STOCKS.length) { currentBars = []; quotes = {}; }
+  renderStockSelectors(); renderWatchlist(); selectStock(selected.symbol); renderSearchResults();
+  persistWatchlist(`Removed ${symbol}.`); restartWatchlistStream();
+}
+function renderSearchResults() {
+  const root = $('stock-results'); root.replaceChildren();
+  searchResults.forEach(stock => {
+    const row = element('div', null, 'stock-result'); row.setAttribute('role', 'listitem');
+    const details = element('div'); details.append(element('strong', stock.symbol), element('span', stock.name), element('small', stock.exchange || 'US equity'));
+    const exists = STOCKS.some(item => item.symbol === stock.symbol);
+    const button = element('button', exists ? 'Added' : 'Add', 'secondary-button'); button.type = 'button'; button.dataset.addStock = stock.symbol;
+    button.disabled = exists || STOCKS.length >= MAX_WATCHLIST; button.setAttribute('aria-label', `${exists ? 'Already watching' : 'Add'} ${stock.symbol}`);
+    button.addEventListener('click', () => addStock(stock)); row.append(details, button); root.append(row);
+  });
+}
+async function searchStocks() {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = null;
+  const epoch = ++searchEpoch, query = $('stock-query').value.trim();
+  if (!query || query.length > 60) { searchResults = []; renderSearchResults(); $('stock-search-status').textContent = 'Enter a symbol or company name (up to 60 characters).'; return; }
+  searchResults = []; renderSearchResults();
+  $('stock-search-status').textContent = 'Searching US stocks and ETFs…'; $('search-stocks').disabled = true;
+  try {
+    const data = await api(`/api/stocks/search?q=${encodeURIComponent(query)}`);
+    if (epoch !== searchEpoch) return;
+    searchResults = (data.results || []).map(row => { const stock = validStock(row); return stock ? {...stock, exchange: row.exchange} : null; }).filter(Boolean);
+    renderSearchResults();
+    $('stock-search-status').textContent = searchResults.length ? `${searchResults.length} results · ${data.source || 'market data'} · ${STOCKS.length}/${MAX_WATCHLIST} saved` : 'No matching US stocks or ETFs. Try another name or ticker.';
+  } catch (error) {
+    if (epoch !== searchEpoch) return;
+    searchResults = []; renderSearchResults(); $('stock-search-status').textContent = error.message;
+  } finally { if (epoch === searchEpoch) $('search-stocks').disabled = false; }
+}
+$('open-stock-search').addEventListener('click', () => { $('stock-dialog').showModal(); $('stock-query').focus(); renderSearchResults(); });
+$('close-stock-search').addEventListener('click', () => $('stock-dialog').close());
+$('stock-dialog').addEventListener('close', () => { searchEpoch++; if (searchTimer) clearTimeout(searchTimer); searchTimer = null; $('search-stocks').disabled = false; });
+$('stock-search-form').addEventListener('submit', event => { event.preventDefault(); searchStocks(); });
+$('stock-query').addEventListener('input', () => {
+  searchEpoch++; if (searchTimer) clearTimeout(searchTimer);
+  if (!$('stock-query').value.trim()) { searchResults = []; renderSearchResults(); $('stock-search-status').textContent = 'Enter a symbol or company name to search.'; $('search-stocks').disabled = false; return; }
+  searchTimer = setTimeout(searchStocks, 350);
 });
+renderStockSelectors();
 $('symbol').addEventListener('change', event => selectStock(event.target.value));
 ['quantity', 'limit-price'].forEach(id => $(id).addEventListener('input', updateEstimate));
 $('order-type').addEventListener('change', updateEstimate);
@@ -411,7 +510,7 @@ document.querySelectorAll('[data-range]').forEach(button => button.addEventListe
 document.querySelectorAll('[data-side]').forEach(button => button.addEventListener('click', () => { side = button.dataset.side; document.querySelectorAll('[data-side]').forEach(item => { item.classList.toggle('selected', item === button); item.setAttribute('aria-pressed', String(item === button)); }); message(''); updateEstimate(); }));
 $('order-form').addEventListener('submit', async event => {
   event.preventDefault();
-  if (pendingReview || submitting || !connected) return;
+  if (!STOCKS.length || pendingReview || submitting || !connected) return;
   const draft = {symbol: selected.symbol, side, qty: $('quantity').value, order_type: $('order-type').value};
   if (draft.order_type === 'limit') draft.limit_price = $('limit-price').value;
   $('submit-order').disabled = true;

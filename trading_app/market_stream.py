@@ -7,8 +7,17 @@ from datetime import datetime, timezone
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
+from .alpaca_client import AlpacaClient
 
 SYMBOLS = ('AAPL', 'MSFT', 'NVDA', 'GOOGL', 'TSLA')
+
+
+def watch_symbols(symbols=None):
+    values = SYMBOLS if symbols is None else symbols
+    result = tuple(dict.fromkeys(AlpacaClient.symbol(value) for value in values))
+    if not 1 <= len(result) <= 20:
+        raise ValueError('Choose between 1 and 20 stocks for a watchlist stream.')
+    return result
 
 
 class SubscriptionDenied(Exception):
@@ -16,9 +25,9 @@ class SubscriptionDenied(Exception):
         self.code = code
 
 
-def normalize_event(event, feed, now=None):
+def normalize_event(event, feed, now=None, symbols=None):
     """Whitelist public fields; never relay broker authentication/error payloads."""
-    if not isinstance(event, dict) or event.get('S') not in SYMBOLS or event.get('T') not in {'t', 'b', 'u'}:
+    if not isinstance(event, dict) or event.get('S') not in (SYMBOLS if symbols is None else symbols) or event.get('T') not in {'t', 'b', 'u'}:
         return None
     try:
         stamp = datetime.fromisoformat(event['t'].replace('Z', '+00:00'))
@@ -39,7 +48,7 @@ def normalize_event(event, feed, now=None):
 class MarketStream:
     def __init__(self, broker, connector=connect, sleep=asyncio.sleep):
         self.broker, self.connector, self.sleep = broker, connector, sleep
-        self.subscribers = set()
+        self.subscribers = {}
         self.task = None
         self.latest = {}
         self.lock = asyncio.Lock()
@@ -54,28 +63,52 @@ class MarketStream:
             self.state = event
         elif event['type'] == 'quote':
             self.latest[event['symbol']] = event
-        for queue in tuple(self.subscribers):
+        for queue, symbols in tuple(self.subscribers.items()):
+            if event['type'] in {'quote', 'bar'} and event.get('symbol') not in symbols:
+                continue
             if queue.full():
                 queue.get_nowait()  # Bound memory for slow browsers; keep the most recent events.
             queue.put_nowait(event)
 
+    @property
+    def desired(self):
+        return set().union(*self.subscribers.values()) if self.subscribers else set()
+
+    async def restart(self):
+        # Close before reconnecting: free Alpaca feeds may allow only one connection.
+        await self.close()
+        desired = self.desired
+        self.latest = {symbol: event for symbol, event in self.latest.items() if symbol in desired}
+        self.broadcast(self.status('connecting', 'Connecting the current watchlist to Alpaca market data.'))
+        self.task = asyncio.create_task(self.run())
+
     @asynccontextmanager
-    async def subscribe(self):
+    async def subscribe(self, symbols=None):
+        selected = frozenset(watch_symbols(symbols))
         queue = asyncio.Queue(maxsize=128)
         async with self.lock:
-            self.subscribers.add(queue)
-            queue.put_nowait(self.state)
-            for event in self.latest.values():
-                queue.put_nowait(event)
-            if self.task is None or self.task.done():
-                self.task = asyncio.create_task(self.run())
+            previous = self.desired
+            if len(previous | selected) > 50:
+                raise ValueError('At most 50 distinct streaming symbols are supported across open tabs. Close an unused tab and retry.')
+            self.subscribers[queue] = selected
+            if self.desired != previous or self.task is None or self.task.done():
+                await self.restart()
+            else:
+                queue.put_nowait(self.state)
+            for symbol, event in self.latest.items():
+                if symbol in selected:
+                    queue.put_nowait(event)
         try:
             yield queue
         finally:
             async with self.lock:
-                self.subscribers.discard(queue)
+                previous = self.desired
+                self.subscribers.pop(queue, None)
                 if not self.subscribers:
                     await self.close()
+                    self.latest.clear()
+                elif self.desired != previous:
+                    await self.restart()
 
     async def close(self):
         if self.task:
@@ -101,6 +134,7 @@ class MarketStream:
     async def run(self):
         retry = 1
         while True:
+            desired = self.desired
             try:
                 self.broadcast(self.status('connecting', 'Connecting to Alpaca market data.'))
                 url = 'wss://stream.data.alpaca.markets/v2/' + self.broker.feed
@@ -112,17 +146,17 @@ class MarketStream:
                         while not authenticated:
                             events = self.decode(await socket.recv())
                             authenticated = any(event.get('T') == 'success' and event.get('msg') == 'authenticated' for event in events)
-                    await socket.send(json.dumps({'action': 'subscribe', 'trades': list(SYMBOLS), 'bars': list(SYMBOLS), 'updatedBars': list(SYMBOLS)}))
+                    await socket.send(json.dumps({'action': 'subscribe', 'trades': sorted(desired), 'bars': sorted(desired), 'updatedBars': sorted(desired)}))
                     async for raw in socket:
                         for event in self.decode(raw):
                             if event.get('T') == 'subscription':
                                 subscribed = set(event.get('trades', []))
-                                if not set(SYMBOLS).issubset(subscribed):
+                                if not desired.issubset(subscribed):
                                     raise SubscriptionDenied('incomplete_subscription')
                                 self.broadcast(self.status('connected', 'Market stream connected. Prices update when trades arrive.'))
                                 retry = 1
                             else:
-                                normalized = normalize_event(event, self.broker.feed)
+                                normalized = normalize_event(event, self.broker.feed, symbols=desired)
                                 if normalized:
                                     self.broadcast(normalized)
             except SubscriptionDenied as exc:
@@ -135,14 +169,18 @@ class MarketStream:
             retry = min(30, retry * 2)
 
 
-async def stream_events(hub, request):
+async def stream_events(hub, request, symbols=None):
     """SSE over fetch, so bearer tokens stay in headers rather than URLs."""
-    async with hub.subscribe() as queue:
-        while not await request.is_disconnected():
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=15)
-            except TimeoutError:
-                event = {**hub.state, 'type': 'heartbeat'}
-            yield 'data: ' + json.dumps(event, separators=(',', ':')) + '\n\n'
-            if event.get('retryable') is False:
-                break
+    try:
+        async with hub.subscribe(symbols) as queue:
+            while not await request.is_disconnected():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                except TimeoutError:
+                    event = {**hub.state, 'type': 'heartbeat'}
+                yield 'data: ' + json.dumps(event, separators=(',', ':')) + '\n\n'
+                if event.get('retryable') is False:
+                    break
+    except ValueError as exc:
+        event = hub.status('unavailable', str(exc), retryable=False)
+        yield 'data: ' + json.dumps(event, separators=(',', ':')) + '\n\n'

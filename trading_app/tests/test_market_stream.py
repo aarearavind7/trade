@@ -87,7 +87,7 @@ def test_two_browser_subscribers_share_one_authenticated_upstream_connection():
                 assert connector.calls[0][0] == 'wss://stream.data.alpaca.markets/v2/iex'
                 assert socket.sent[0]['action'] == 'auth'
                 assert set(socket.sent[1]['trades']) == set(SYMBOLS)
-                assert socket.sent[1]['updatedBars'] == list(SYMBOLS)
+                assert set(socket.sent[1]['updatedBars']) == set(SYMBOLS)
                 async with hub.subscribe() as late:
                     assert (await until(late, lambda event: event['type'] == 'quote'))['price'] == '201.25'
             assert hub.task and not hub.task.done()
@@ -159,4 +159,59 @@ def test_sse_uses_public_json_and_stops_on_terminal_error():
         assert 'unavailable' in events[-1]
         assert 'private-test-key' not in ''.join(events)
         assert hub.task is None
+    asyncio.run(scenario())
+
+
+def test_watchlist_symbol_validation_and_custom_event_filtering():
+    from trading_app.market_stream import watch_symbols
+    assert watch_symbols([' amzn ', 'AMZN', 'BRK.B']) == ('AMZN', 'BRK.B')
+    for values in ([], ['../BAD'], ['X' + str(index) for index in range(21)]):
+        with pytest.raises(ValueError): watch_symbols(values)
+    assert normalize_event(trade(S='AMZN'), 'iex', NOW, symbols={'AMZN'})['symbol'] == 'AMZN'
+    assert normalize_event(trade(S='AAPL'), 'iex', NOW, symbols={'AMZN'}) is None
+
+
+def test_distinct_tab_watchlists_restart_one_connection_and_route_only_requested_symbols():
+    async def scenario():
+        sockets, active = [], [0, 0]
+        hub = None
+        class Factory:
+            def __call__(self, *args, **kwargs):
+                desired = sorted(hub.desired)
+                data = [[{'T': 'success', 'msg': 'authenticated'}], [{'T': 'subscription', 'trades': desired}], [trade(S=symbol) for symbol in desired]]
+                socket = Socket(data)
+                sockets.append(socket)
+                @asynccontextmanager
+                async def connection():
+                    active[0] += 1; active[1] = max(active[1], active[0])
+                    try: yield socket
+                    finally: active[0] -= 1; socket.closed = True
+                return connection()
+        hub = MarketStream(broker(), connector=Factory())
+        async with hub.subscribe(['AAPL']) as one:
+            await until(one, lambda event: event['type'] == 'quote')
+            async with hub.subscribe(['AMZN']) as two:
+                result = await until(two, lambda event: event['type'] == 'quote')
+                assert result['symbol'] == 'AMZN'
+                rows = []
+                while not one.empty(): rows.append(one.get_nowait())
+                assert all(event.get('symbol') in {None, 'AAPL'} for event in rows)
+                assert set(sockets[-1].sent[1]['trades']) == {'AAPL', 'AMZN'}
+                assert sockets[0].closed
+            assert hub.desired == {'AAPL'}
+            await until(one, lambda event: event['type'] == 'quote')
+        assert len(sockets) == 3 and active[1] == 1
+        assert all(socket.closed for socket in sockets)
+    asyncio.run(scenario())
+
+
+def test_stream_capacity_error_is_delivered_as_terminal_sse():
+    async def scenario():
+        hub = MarketStream(broker(), connector=Connector(Socket(frames())))
+        class Request:
+            async def is_disconnected(self): return False
+        async with hub.subscribe(['A' + str(index) for index in range(20)]):
+            async with hub.subscribe(['B' + str(index) for index in range(20)]):
+                events = [event async for event in stream_events(hub, Request(), ['C' + str(index) for index in range(20)])]
+                assert len(events) == 1 and '50 distinct' in events[0] and '"retryable":false' in events[0]
     asyncio.run(scenario())

@@ -75,13 +75,23 @@ Balances, positions, P/L, and order history require an actual account and are hi
 
 Set `PUBLIC_MARKET_DATA=false` to disable the public fallback and retain the setup-required screen until Alpaca credentials are available.
 
+## Stock search and custom watchlist
+
+Use **+ Add stocks** in the watchlist header. Search by ticker or company name (for example, `AMZN`, `Amazon`, or `Berkshire`). Results are limited to eligible US stocks and ETFs. Click **Add** to save a result and open its chart. The chart tabs and order asset selector update immediately. The **×** action beside a watchlist row removes that stock.
+
+The default five symbols are only starting selections. You can save up to **20** unique stocks, remove every stock, and build a new list. Changes are saved in this browser's local storage for this dashboard origin and survive reloads. Different browser profiles or different origins (`localhost` versus `127.0.0.1`, or different ports) keep separate selections. If storage is unavailable, the UI reports that changes last only for the current session. Watchlist edits do not submit order requests.
+
+Search uses Alpaca's active, tradable US-equity catalogue when paper credentials are configured (cached for one hour), or Yahoo Finance search in public market-only mode (cached for one minute). Foreign listings, futures, and duplicate public results are filtered out. US class-share notation is normalized, such as `BRK.B` in the application and `BRK-B` for Yahoo chart requests. The public response cache evicts older entries rather than requiring a restart after many different searches.
+
+The Alpaca stream follows the selected watchlist. Tabs share the union of their requested symbols through one upstream connection; changing that union closes the old connection before reconnecting with the new symbols. Each tab receives only its requested prices and bars. Up to **50 distinct symbols across open tabs** are supported; an explicit connection message explains when that limit or a provider subscription limit is reached. Without streaming access, periodic REST updates still use the saved watchlist.
+
 ## Market data
 
 - `ALPACA_DATA_FEED=iex` is the default. It provides exchange-specific IEX data, not the consolidated US market. Quote timestamps, feed coverage, and market open/closed status are visible.
 - `sip` requires the corresponding Alpaca data entitlement. `delayed_sip` is an explicitly delayed feed.
 - A quote older than 120 seconds is marked delayed/stale. Orders are blocked during an open session when the reference quote is stale; use a current entitled feed for trading.
 - IEX and entitled SIP historical requests now end at the current time; the previous fixed 16-minute delay is removed for these feeds. `delayed_sip` history keeps a labelled 16-minute delay. No bars may be returned overnight, on holidays, or over a weekend for the 1D range; choose 1W or longer.
-- The backend authenticates to Alpaca's stock-market WebSocket at `wss://stream.data.alpaca.markets/v2/<feed>` and subscribes to trades, minute bars, and corrected bars for AAPL, MSFT, NVDA, GOOGL, and TSLA. One connection per Python process is shared across browser tabs. Alpaca credentials never reach the browser.
+- The backend authenticates to Alpaca's stock-market WebSocket at `wss://stream.data.alpaca.markets/v2/<feed>` and subscribes to trades, minute bars, and corrected bars for the current watchlists (AAPL, MSFT, NVDA, GOOGL, and TSLA are the initial defaults). One connection per Python process is shared across browser tabs. Alpaca credentials never reach the browser.
 - Authenticated server-sent events (`GET /api/market/stream`) update watchlist prices, the selected price, and the order estimate as trades arrive. The **1D chart** updates its current minute from trades and accepts completed/corrected one-minute broker bars. Current-minute points are provisional until the broker completes that bar. Longer ranges use refreshed historical bars.
 - A connection indicator shows live, delayed/stale, connecting, reconnecting, or unavailable. It never fabricates trades when a market is closed or a symbol is inactive. IEX only covers IEX trades, so it may update less frequently than consolidated SIP.
 - Transport interruptions reconnect with a capped backoff. Permission, authentication, or subscription-limit denials stop automatic stream retries and show an actionable message; fix the cause and click **Refresh**. The browser cancels streams when hidden and reconnects when visible. REST account/history refresh continues every 30 seconds as a fallback; quote freshness is checked every five seconds.
@@ -129,7 +139,8 @@ Realized P/L uses **weighted-average cost accounting for long-only fills**, excl
 | GET | `/api/account` | Paper-account balances and status. |
 | GET | `/api/positions` | Broker positions, average cost, unrealized P/L. |
 | GET | `/api/market/clock` | Exchange clock and next open/close. |
-| GET | `/api/market/stream` | Authenticated SSE prices, minute bars, feed/connection status, and heartbeats. |
+| GET | `/api/market/stream?symbols=AAPL,AMZN` | Authenticated SSE for 1–20 validated symbols, with prices, minute bars, connection status and heartbeats. Omit `symbols` for the original defaults. |
+| GET | `/api/stocks/search?q=Amazon` | Search US stocks/ETFs by name or ticker; up to 10 results. |
 | GET | `/api/market/{symbol}/quote` | Timestamped Alpaca trade or read-only public quote when paper configuration is unavailable. |
 | GET | `/api/market/{symbol}/bars?period=1D` | Historical bars; also `1W`, `1M`, `1Y`. |
 | POST | `/api/orders/review` | Validate a draft and create a 60-second review. |
@@ -181,7 +192,7 @@ npm ci --prefix web
 npm test --prefix web
 ```
 
-Tests use mocked broker responses and browser DOM/network adapters; they never contact Alpaca. They cover order validation, duplicate/concurrent submissions, crash and timeout recovery, risk reservations, quote staleness, API authorization/failures, fill accounting, review/confirmation, browser recovery after uncertain submissions, shared stream connections, reconnection/denials, fragmented SSE parsing, stale snapshot protection, connection diagnostics, rejected settings, launcher setup, port conflicts, and orderly startup/shutdown.
+Tests use mocked broker responses and browser DOM/network adapters; they never contact Alpaca. They cover order validation, duplicate/concurrent submissions, crash and timeout recovery, risk reservations, quote staleness, API authorization/failures, fill accounting, review/confirmation, browser recovery after uncertain submissions, shared stream connections, reconnection/denials, fragmented SSE parsing, stale snapshot protection, connection diagnostics, rejected settings, launcher setup, port conflicts, orderly startup/shutdown, stock search/filtering, watchlist persistence and empty states, stale search responses, and dynamic stream isolation across tabs.
 
 `.github/workflows/trading-tests.yml` runs the Python suite on 3.11, 3.12, and 3.13 with an 80% coverage floor, checks JavaScript syntax, and runs dashboard tests. Existing repository-validation workflows remain in place. DOM tests do not replace full visual browser testing or an integration check with your own paper account.
 

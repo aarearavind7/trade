@@ -20,8 +20,9 @@ from typing import Literal
 
 from .alpaca_client import AlpacaClient, AlpacaError
 from .service import OrderDraft, OrderStore, RiskLimits, TradeError, TradingService, fill_performance
-from .market_stream import MarketStream, stream_events
+from .market_stream import MarketStream, stream_events, watch_symbols
 from .public_market_data import PublicMarketData, PublicDataError
+from .stock_search import StockSearch, query_text
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -45,10 +46,11 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         if application.state.market_stream is not None:
             await application.state.market_stream.close()
 
-    application = FastAPI(title='Trade Paper API', version='1.2.0', lifespan=lifespan, description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
+    application = FastAPI(title='Trade Paper API', version='1.3.0', lifespan=lifespan, description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
     application.state.market_stream = None
     application.state.broker = broker
     application.state.public_market_data = public_client or PublicMarketData()
+    application.state.stock_search = StockSearch(application.state.public_market_data)
     public_enabled = os.getenv('PUBLIC_MARKET_DATA', 'true').strip().lower() in {'true', '1', 'yes'}
     application.state.store = store
     application.state.limits = limits
@@ -198,12 +200,27 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         return data.broker.clock() if kind == 'alpaca' else data.clock()
 
     @application.get('/api/market/stream')
-    async def market_stream(request: Request, svc=Depends(service)):
+    async def market_stream(request: Request, symbols: str | None = Query(default=None, max_length=300), svc=Depends(service)):
+        try:
+            selected_symbols = watch_symbols(symbols.split(',') if symbols is not None else None)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         if application.state.market_stream is None:
             application.state.market_stream = MarketStream(svc.broker)
-        return StreamingResponse(stream_events(application.state.market_stream, request),
+        return StreamingResponse(stream_events(application.state.market_stream, request, selected_symbols),
                                  media_type='text/event-stream',
                                  headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})
+
+    @application.get('/api/stocks/search')
+    def stock_search(q: str = Query(min_length=1, max_length=60), _=Depends(authorize)):
+        try:
+            query = query_text(q)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        configured_broker, setup_message = broker_configuration()
+        if configured_broker is None and not public_enabled:
+            raise HTTPException(503, setup_message)
+        return application.state.stock_search.search(query, configured_broker)
 
     @application.get('/api/market/{symbol}/quote')
     def quote(symbol: str, source=Depends(market_source)):

@@ -3,6 +3,9 @@ import json
 import math
 import threading
 import time
+import re
+from collections import OrderedDict
+from weakref import WeakValueDictionary
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -21,24 +24,41 @@ class PublicMarketData:
 
     def __init__(self, opener=urlopen, monotonic=time.monotonic):
         self.opener, self.monotonic = opener, monotonic
-        self.cache, self.locks = {}, {}
+        self.cache, self.locks = OrderedDict(), WeakValueDictionary()
         self.lock = threading.Lock()
+
+    def key_lock(self, key):
+        with self.lock:
+            lock = self.locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self.locks[key] = lock
+            return lock
+
+    def cached(self, key, ttl=15):
+        with self.lock:
+            cached = self.cache.get(key)
+            if cached and self.monotonic() - cached[0] < ttl:
+                self.cache.move_to_end(key)
+                return cached[1]
+        return None
+
+    def remember(self, key, value):
+        with self.lock:
+            self.cache[key] = self.monotonic(), value
+            self.cache.move_to_end(key)
+            while len(self.cache) > 128:
+                self.cache.popitem(last=False)
 
     def chart(self, symbol, period='1D'):
         symbol = AlpacaClient.symbol(symbol)
         key = symbol, period
-        with self.lock:
-            if key not in self.locks:
-                if len(self.locks) >= 128:
-                    raise PublicDataError('Public quote capacity reached. Restart the service to clear the cache.')
-                self.locks[key] = threading.Lock()
-            key_lock = self.locks[key]
-        with key_lock:
-            cached = self.cache.get(key)
-            if cached and self.monotonic() - cached[0] < 15:
-                return cached[1]
+        with self.key_lock(key):
+            cached = self.cached(key)
+            if cached is not None:
+                return cached
             span, interval = self.periods[period]
-            url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + quote(symbol, safe='')
+            url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + quote(symbol.replace('.', '-'), safe='')
             url += '?' + urlencode({'range': span, 'interval': interval, 'includePrePost': 'false'})
             request = Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'})
             try:
@@ -56,8 +76,47 @@ class PublicMarketData:
                 raise PublicDataError('Public market data is unavailable for this symbol. Try again later or connect Alpaca.') from exc
             except (URLError, OSError, TimeoutError, ValueError, TypeError, KeyError, IndexError) as exc:
                 raise PublicDataError('Could not load public market data. Check internet access and retry; Alpaca is available as an alternative.') from exc
-            self.cache[key] = self.monotonic(), result
+            self.remember(key, result)
             return result
+
+    def search(self, query):
+        key = 'search', query.casefold()
+        with self.key_lock(key):
+            cached = self.cached(key, ttl=60)
+            if cached is not None:
+                return cached
+            provider_query = query.upper().replace('.', '-') if re.fullmatch(r'[A-Z]{1,5}\.[A-Z]', query.upper()) else query
+            url = 'https://query1.finance.yahoo.com/v1/finance/search?' + urlencode({'q': provider_query, 'quotesCount': 20, 'newsCount': 0})
+            try:
+                request = Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'})
+                with self.opener(request, timeout=10) as response:
+                    raw = response.read(2000001)
+                if len(raw) > 2000000:
+                    raise ValueError('Response too large')
+                quotes = json.loads(raw)['quotes']
+                if not isinstance(quotes, list):
+                    raise ValueError('Invalid search response')
+            except (HTTPError, URLError, OSError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+                raise PublicDataError('Stock search is temporarily unavailable. Wait a moment and search again, or check Connection setup.') from exc
+            rows, seen = [], set()
+            exchanges = {'NMS', 'NYQ', 'NGM', 'NCM', 'PCX', 'ASE', 'BTS'}
+            for row in quotes:
+                if not isinstance(row, dict) or row.get('quoteType') not in {'EQUITY', 'ETF'} or row.get('exchange') not in exchanges:
+                    continue
+                try:
+                    symbol = row['symbol']
+                    if re.fullmatch(r'[A-Z]{1,5}-[A-Z]', symbol):
+                        symbol = symbol.replace('-', '.')
+                    symbol = AlpacaClient.symbol(symbol)
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    continue
+                if symbol in seen:
+                    continue
+                seen.add(symbol)
+                rows.append({'symbol': symbol, 'name': str(row.get('shortname') or row.get('longname') or symbol)[:200],
+                             'exchange': str(row.get('exchDisp') or row.get('exchange'))[:30]})
+            self.remember(key, rows[:10])
+            return rows[:10]
 
     @staticmethod
     def price(value):

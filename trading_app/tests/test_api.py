@@ -374,7 +374,7 @@ def test_stream_requires_application_token(tmp_path, broker):
 def test_sse_endpoint_content_type_and_auth_header(tmp_path, broker, monkeypatch):
     import trading_app.api as api
     app = create_app(broker, tmp_path / 'stream.sqlite3', access_token='stream-app-token', allowed_origins=[])
-    async def finite_events(hub, request):
+    async def finite_events(hub, request, symbols=None):
         yield 'data: {"type":"status","state":"connected"}\n\n'
     monkeypatch.setattr(api, 'stream_events', finite_events)
     with TestClient(app) as client:
@@ -423,3 +423,9 @@ def test_connection_checks_require_application_auth(tmp_path, broker):
     with TestClient(create_app(broker, tmp_path / 'checks.sqlite3', access_token='private-app-token', allowed_origins=[])) as client:
         assert client.get('/api/connection').status_code == 401
         assert client.get('/api/connection', headers={'Authorization': 'Bearer private-app-token'}).status_code == 200
+
+
+def test_stream_validates_custom_symbols_before_connecting(client, app):
+    assert client.get('/api/market/stream?symbols=../BAD').status_code == 422
+    assert client.get('/api/market/stream?symbols=').status_code == 422
+    assert app.state.market_stream is None

@@ -15,7 +15,7 @@ async function boot(options = {}) {
   window.HTMLElement.prototype.showModal = function () { this.open = true; };
   window.HTMLElement.prototype.close = function () { this.open = false; };
   const saved = options.saved || new Map();
-  const storage = {getItem: key => saved.get(key) || null, setItem: (key, value) => saved.set(key, value)};
+  const storage = {getItem: key => saved.get(key) || null, setItem: (key, value) => { if (options.storageFailure) throw new Error('Storage unavailable'); saved.set(key, value); }};
   const calls = [];
   let submitCount = 0;
   const periodicRefresh = [];
@@ -27,6 +27,11 @@ async function boot(options = {}) {
     if (options.offline) throw new TypeError('Failed to fetch');
     if (path === '/api/health') data = {broker_configured: options.configured !== false, setup_message: options.configured === false ? 'Configure Alpaca paper keys in .env, then restart Uvicorn.' : null, market_stream: options.stream === true, public_market_data: options.publicData === true};
     else if (path === '/api/account') data = {cash: '90000', equity: '100000', buying_power: '180000'};
+    else if (path === '/api/stocks/search') {
+      if (options.searchHandler) return options.searchHandler(url, init);
+      if (options.searchFailure) return new Response(JSON.stringify({detail: 'Stock search is temporarily unavailable'}), {status: 502, headers: {'Content-Type': 'application/json'}});
+      data = {source: 'Yahoo Finance', results: options.searchResults || [{symbol: 'AMZN', name: 'Amazon.com, Inc.', exchange: 'NASDAQ'}, {symbol: 'JPM', name: 'JPMorgan Chase', exchange: 'NYSE'}]};
+    }
     else if (path === '/api/connection') {
       if (options.connectionUnauthorized) return new Response(JSON.stringify({detail: 'Enter the application access token'}), {status: 401, headers: {'Content-Type': 'application/json'}});
       data = {service: options.wrongConnection ? 'other-service' : 'trade-paper-api',
@@ -35,12 +40,13 @@ async function boot(options = {}) {
         paper_account: {status: options.configured === false ? 'not_configured' : 'connected', message: options.configured === false ? 'Paper account is optional' : 'Paper account active', action: 'Keys stay in .env'}};
     }
     else if (path === '/api/market/stream') {
+      let ownTransport;
       const body = new ReadableStream({
         start(controller) {
-          streamTransport = controller;
+          ownTransport = controller; streamTransport = controller;
           init.signal.addEventListener('abort', () => { try { controller.error(new DOMException('Aborted', 'AbortError')); } catch {} });
         },
-        cancel() { streamTransport = null; }
+        cancel() { if (streamTransport === ownTransport) streamTransport = null; }
       });
       return new Response(body, {headers: {'Content-Type': 'text/event-stream'}});
     }
@@ -271,4 +277,94 @@ test('local setup shortcut selects the correct server without transmitting stale
   await app.click('#test-connection');
   assert.equal(app.calls.length, calls);
   assert.match(app.$('connection-error').textContent, /HTTPS/);
+});
+
+
+test('search adds a custom stock, prevents duplicates and restores the watchlist after reload', async () => {
+  const app = await boot({configured: false, publicData: true});
+  await app.click('#open-stock-search');
+  app.$('stock-query').value = 'Amazon';
+  await app.submit('stock-search-form');
+  assert.match(app.$('stock-results').textContent, /Amazon.com/);
+  await app.click('[data-add-stock="AMZN"]');
+  assert.equal(app.$('watchlist-count').textContent, '6');
+  assert.match(app.$('quote-name').textContent, /Amazon/);
+  assert.equal(app.$('symbol').value, 'AMZN');
+  assert.ok(app.$('stock-tabs').querySelector('[data-stock="AMZN"]'));
+  assert.equal(app.$('stock-results').querySelector('[data-add-stock="AMZN"]').disabled, true);
+  await app.click('[data-add-stock="AMZN"]');
+  assert.equal(JSON.parse(app.saved.get('trade-watchlist-v1')).length, 6);
+  const restored = await boot({saved: app.saved, configured: false, publicData: true});
+  assert.match(restored.$('watchlist-body').textContent, /AMZN/);
+  await restored.click('[data-remove-stock="AMZN"]');
+  assert.equal(restored.$('watchlist-count').textContent, '5');
+  assert.ok(!JSON.parse(restored.saved.get('trade-watchlist-v1')).some(stock => stock.symbol === 'AMZN'));
+  assert.equal(restored.submitCount, 0);
+});
+
+test('watchlists can be emptied and rebuilt without loading a hidden default stock', async () => {
+  const app = await boot({configured: false, publicData: true});
+  for (const symbol of ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'TSLA']) await app.click(`[data-remove-stock="${symbol}"]`);
+  assert.equal(app.saved.get('trade-watchlist-v1'), '[]');
+  assert.equal(app.$('watchlist-count').textContent, '0');
+  assert.equal(app.$('symbol').disabled, true);
+  assert.equal(app.$('submit-order').disabled, true);
+  assert.match(app.$('chart-empty').textContent, /watchlist is empty/);
+  const restored = await boot({saved: app.saved, configured: false, publicData: true});
+  assert.equal(restored.$('watchlist-count').textContent, '0');
+  assert.ok(!restored.calls.some(call => call.path.endsWith('/quote') || call.path.endsWith('/bars')));
+  await restored.click('#open-stock-search'); restored.$('stock-query').value = 'Amazon';
+  await restored.submit('stock-search-form'); await restored.click('[data-add-stock="AMZN"]');
+  assert.equal(restored.$('watchlist-count').textContent, '1');
+  assert.equal(restored.$('price').textContent, '$100.00');
+});
+
+test('watchlist limits, unavailable storage and unsafe saved names are handled safely', async () => {
+  const saved = new Map([['trade-watchlist-v1', JSON.stringify(Array.from({length: 20}, (_, i) => ({symbol: 'S' + i, name: 'Stock ' + i})))]]);
+  const full = await boot({saved});
+  await full.click('#open-stock-search'); full.$('stock-query').value = 'Amazon'; await full.submit('stock-search-form');
+  assert.equal(full.$('stock-results').querySelector('[data-add-stock="AMZN"]').disabled, true);
+  await full.click('[data-add-stock="AMZN"]');
+  assert.equal(JSON.parse(saved.get('trade-watchlist-v1')).length, 20);
+  const blocked = await boot({storageFailure: true});
+  await blocked.click('#open-stock-search'); blocked.$('stock-query').value = 'Amazon'; await blocked.submit('stock-search-form'); await blocked.click('[data-add-stock="AMZN"]');
+  assert.match(blocked.$('watchlist-status').textContent, /storage is unavailable/);
+  const unsafe = await boot({saved: new Map([['trade-watchlist-v1', JSON.stringify([{symbol: 'AMZN', name: '<img src=x onerror=alert(1)>'}])]])});
+  assert.equal(unsafe.$('watchlist-body').querySelector('img'), null);
+  assert.match(unsafe.$('watchlist-body').textContent, /<img/);
+});
+
+test('search failures and stale search responses do not show misleading results', async () => {
+  const app = await boot({searchFailure: true});
+  await app.click('#open-stock-search'); app.$('stock-query').value = 'Amazon'; await app.submit('stock-search-form');
+  assert.match(app.$('stock-search-status').textContent, /temporarily unavailable/);
+  assert.equal(app.$('stock-results').children.length, 0);
+  let resolveOld;
+  app.options.searchFailure = false;
+  app.options.searchHandler = url => {
+    const query = new URL(url).searchParams.get('q');
+    if (query === 'Amazon') return new Promise(resolve => { resolveOld = resolve; });
+    return new Response(JSON.stringify({source: 'test', results: [{symbol: 'JPM', name: 'JPMorgan', exchange: 'NYSE'}]}), {headers: {'Content-Type': 'application/json'}});
+  };
+  await app.submit('stock-search-form');
+  app.$('stock-query').value = 'JPM'; await app.submit('stock-search-form');
+  resolveOld(new Response(JSON.stringify({source: 'test', results: [{symbol: 'AMZN', name: 'Amazon'}]}), {headers: {'Content-Type': 'application/json'}}));
+  await flush();
+  assert.ok(app.$('stock-results').querySelector('[data-add-stock="JPM"]'));
+  assert.equal(app.$('stock-results').querySelector('[data-add-stock="AMZN"]'), null);
+});
+
+test('custom watchlist stocks are included in the authenticated live feed', async () => {
+  const app = await boot({stream: true});
+  try {
+    await app.click('#open-stock-search'); app.$('stock-query').value = 'Amazon'; await app.submit('stock-search-form'); await app.click('[data-add-stock="AMZN"]');
+    const requests = app.calls.filter(call => call.path === '/api/market/stream');
+    assert.ok(new URL(requests.at(-1).url).searchParams.get('symbols').split(',').includes('AMZN'));
+    await app.emit({type: 'status', state: 'connected'});
+    await app.emit({type: 'quote', symbol: 'AMZN', price: '205', timestamp: new Date(Date.now() + 10).toISOString(), feed: 'iex', delayed: false, coverage: 'IEX exchange only'});
+    assert.equal(app.$('price').textContent, '$205.00');
+    await app.click('[data-remove-stock="AMZN"]');
+    const latest = app.calls.filter(call => call.path === '/api/market/stream').at(-1);
+    assert.ok(!new URL(latest.url).searchParams.get('symbols').split(',').includes('AMZN'));
+  } finally { await app.close(); }
 });

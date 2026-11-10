@@ -102,6 +102,9 @@ class AlpacaClient:
     def asset(self, symbol):
         return self._request('GET', self.trading_url + '/v2/assets/' + quote(self.symbol(symbol), safe=''))
 
+    def assets(self):
+        return self._request('GET', self.trading_url + '/v2/assets', params={'status': 'active', 'asset_class': 'us_equity'})
+
     def latest_trade(self, symbol):
         symbol = quote(self.symbol(symbol), safe='')
         return self._request('GET', self.data_url + '/v2/stocks/' + symbol + '/trades/latest', params={'feed': self.feed})

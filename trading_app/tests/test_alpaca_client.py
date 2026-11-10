@@ -201,3 +201,12 @@ class HistoricalFeedTests(unittest.TestCase):
         client.feed = 'delayed_sip'
         result = client.bars('AAPL', '1D')
         assert result['delay_minutes'] == 16 and result['delayed']
+
+
+class AssetCatalogueTests(unittest.TestCase):
+    def test_search_catalogue_requests_only_active_us_equities(self):
+        session = FakeSession(FakeResponse(payload=[]))
+        client = AlpacaClient(api_key='test-key', secret_key='test-secret', session=session)
+        client.assets()
+        assert session.calls[0][1].endswith('/v2/assets')
+        assert session.calls[0][2]['params'] == {'status': 'active', 'asset_class': 'us_equity'}
