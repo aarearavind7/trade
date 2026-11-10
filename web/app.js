@@ -16,7 +16,7 @@ let apiBase = storage.get('trade-api-base') || location.origin;
 let apiToken = storage.get('trade-api-token', true);
 let selected = STOCKS[0], side = 'buy', range = '1D', review = null;
 let connected = false, refreshing = false, submitting = false, selectionEpoch = 0;
-let configurationBlocked = false;
+let configurationBlocked = false, publicMarketMode = false, marketConnected = false;
 let streamSupported = false, streamController = null, streamRetryTimer = null, streamTerminal = false;
 let streamGeneration = 0, streamState = 'waiting', streamRetry = 1000, streamDetail = '';
 const liveBars = new Map();
@@ -92,6 +92,11 @@ function quoteDelayed(quote) {
 }
 function renderStreamStatus(detail) {
   if (detail !== undefined) streamDetail = detail;
+  if (publicMarketMode) {
+    $('stream-status').className = 'stream-indicator delayed';
+    $('stream-status').textContent = 'Yahoo Finance · 30-second refresh · may be delayed';
+    return;
+  }
   const quote = quotes[selected.symbol];
   const delayed = quoteDelayed(quote);
   const live = streamState === 'connected' && quote && !delayed;
@@ -107,7 +112,7 @@ function renderQuote() {
   const change = quote?.change_pct == null ? null : Number(quote.change_pct);
   $('change').textContent = change == null ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`;
   $('change').className = change != null && change < 0 ? 'negative' : 'positive';
-  $('quote-time').textContent = quote ? `${quoteDelayed(quote) ? 'Delayed / stale' : 'Latest trade'} · ${time(quote.timestamp)}` : 'No quote available';
+  $('quote-time').textContent = quote ? `${quote.timing_verified === false ? 'Market price · timing unverified' : quoteDelayed(quote) ? 'Delayed / stale' : 'Latest trade'} · ${time(quote.timestamp)}` : 'No quote available';
   $('feed-label').textContent = quote ? `${quote.coverage} · ${quote.feed}` : 'Awaiting market data';
   renderStreamStatus(); updateEstimate();
 }
@@ -140,7 +145,7 @@ async function loadSelected() {
     currentBars = results[1].value.bars || [];
     if (period === '1D') mergeLiveBars(symbol);
     const delay = results[1].value.delay_minutes || 0;
-    $('chart-data-note').textContent = `${delay ? `Historical bars · ≥${delay} min delay` : period === '1D' ? '1-minute bars · live trade updates' : 'Historical bars · current feed'}${results[1].value.next_page_token ? ' · truncated' : ''}`;
+    $('chart-data-note').textContent = results[1].value.source === 'Yahoo Finance' ? 'Yahoo Finance · may be delayed · refreshed every 30 seconds' : `${delay ? `Historical bars · ≥${delay} min delay` : period === '1D' ? '1-minute bars · live trade updates' : 'Historical bars · current feed'}${results[1].value.next_page_token ? ' · truncated' : ''}`;
   } else { currentBars = []; $('chart-data-note').textContent = results[1].reason.message; }
   renderQuote(); renderChart(); renderWatchlist();
 }
@@ -149,7 +154,7 @@ function selectStock(symbol) {
   $('symbol').value = selected.symbol;
   document.querySelectorAll('[data-stock]').forEach(button => { const active = button.dataset.stock === symbol; button.classList.toggle('selected', active); button.setAttribute('aria-pressed', String(active)); });
   currentBars = []; renderQuote(); renderChart();
-  if (connected) loadSelected();
+  if (marketConnected || connected) loadSelected();
 }
 function renderWatchlist() {
   const body = $('watchlist-body'); body.replaceChildren();
@@ -159,7 +164,7 @@ function renderWatchlist() {
     asset.append(element('span', stock.icon, 'asset-icon'), name);
     const change = quote?.change_pct == null ? null : Number(quote.change_pct);
     const timestamp = element('span', quote ? new Date(quote.timestamp).toLocaleTimeString() : '—');
-    if (quote) timestamp.append(element('small', quoteDelayed(quote) ? 'Delayed / stale' : quote.coverage, 'quote-state'));
+    if (quote) timestamp.append(element('small', quote.timing_verified === false ? 'May be delayed' : quoteDelayed(quote) ? 'Delayed / stale' : quote.coverage, 'quote-state'));
     const action = element('button', '↗', 'trade-link'); action.type = 'button'; action.setAttribute('aria-label', `Trade ${stock.symbol}`);
     action.addEventListener('click', () => { selectStock(stock.symbol); $('order-form').scrollIntoView({behavior: 'smooth', block: 'center'}); $('quantity').focus({preventScroll: true}); });
     [asset, money(quote?.price), change == null ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`, timestamp, action].forEach((value, index) => {
@@ -330,20 +335,47 @@ async function startMarketStream() {
 }
 async function refresh() {
   if (refreshing || submitting) return;
-  refreshing = true; $('refresh-data').disabled = true;
+  refreshing = true; $('refresh-data').disabled = true; $('refresh-market').disabled = true;
   try {
     const health = await api('/api/health');
-    configurationBlocked = health.broker_configured === false;
+    const previousPublicMode = publicMarketMode;
+    publicMarketMode = health.broker_configured === false && health.public_market_data === true;
+    if (previousPublicMode !== publicMarketMode) { liveBars.clear(); quotes = {}; currentBars = []; stopMarketStream(); }
+    configurationBlocked = health.broker_configured === false && !publicMarketMode;
+    document.body.classList.toggle('market-only', publicMarketMode);
+    $('account-label').textContent = publicMarketMode ? 'Market data only' : 'Practice account';
+    $('account-mode').textContent = publicMarketMode ? 'No trading account connected' : 'Personal workspace';
+    $('account-status').textContent = publicMarketMode ? 'Market data only' : 'Paper trading';
+    $('data-disclaimer').textContent = publicMarketMode ? 'Yahoo Finance · quotes may be delayed · no trading account connected' : 'Alpaca paper trading · IEX prices may differ from the consolidated market.';
+    $('order-note').textContent = publicMarketMode
+      ? 'Prices are available without keys. Connect Alpaca paper credentials in the server .env to enable orders. Public prices are never used to submit trades.'
+      : 'Orders go to Alpaca paper trading after your confirmation. Market buys reserve a 2% price buffer.';
     streamSupported = health.market_stream === true;
     if (configurationBlocked) {
-      connected = false; quotes = {}; currentBars = []; stopMarketStream();
+      marketConnected = false; connected = false; quotes = {}; currentBars = []; stopMarketStream();
       $('market-status').textContent = 'Alpaca setup required';
       banner(health.setup_message || 'Configure Alpaca paper keys in the server .env file, restart Uvicorn, then click Refresh.', true);
       renderQuote(); renderChart(); renderWatchlist();
       return;
     }
+    if (publicMarketMode) {
+      connected = false; marketConnected = true; stopMarketStream();
+      banner('Real market data from Yahoo Finance · quotes may be delayed. Add Alpaca paper credentials to enable account balances, trading, and streaming.');
+      const schedule = await api('/api/market/clock').catch(() => null);
+      clock = schedule;
+      $('market-status').textContent = schedule?.schedule_available
+        ? `${schedule.is_open ? 'Regular session open' : 'Regular session closed'} · provider schedule estimate`
+        : 'Market data only · session status unavailable';
+      const quotesResult = await Promise.allSettled(STOCKS.map(async stock => {
+        const quote = await api(`/api/market/${stock.symbol}/quote`); saveSnapshot(stock.symbol, quote);
+      }));
+      renderWatchlist(); await loadSelected();
+      if (quotesResult.every(result => result.status === 'rejected')) throw quotesResult[0].reason;
+      return;
+    }
     const results = await Promise.allSettled([api('/api/account'), api('/api/positions'), api('/api/market/clock'), api('/api/orders'), api('/api/risk'), api('/api/performance'), api('/api/trades')]);
     connected = results.slice(0, 3).every(result => result.status === 'fulfilled');
+    marketConnected = connected;
     if (results[0].status === 'fulfilled') account = results[0].value;
     if (results[1].status === 'fulfilled' && account) renderAccount(results[1].value);
     if (results[2].status === 'fulfilled') { clock = results[2].value; $('market-status').textContent = `${clock.is_open ? 'Market open' : 'Market closed'} · ${time(clock.timestamp)}`; }
@@ -364,7 +396,7 @@ async function refresh() {
       renderWatchlist(); await loadSelected(); startMarketStream();
     }
   } catch (error) { connected = false; banner(error.message, true); }
-  finally { refreshing = false; $('refresh-data').disabled = false; updateEstimate(); }
+  finally { refreshing = false; $('refresh-data').disabled = false; $('refresh-market').disabled = false; updateEstimate(); }
 }
 
 STOCKS.forEach(stock => {
@@ -374,7 +406,7 @@ STOCKS.forEach(stock => {
 $('symbol').addEventListener('change', event => selectStock(event.target.value));
 ['quantity', 'limit-price'].forEach(id => $(id).addEventListener('input', updateEstimate));
 $('order-type').addEventListener('change', updateEstimate);
-document.querySelectorAll('[data-range]').forEach(button => button.addEventListener('click', () => { range = button.dataset.range; document.querySelectorAll('[data-range]').forEach(item => { item.classList.toggle('selected', item === button); item.setAttribute('aria-pressed', String(item === button)); }); if (connected) loadSelected(); }));
+document.querySelectorAll('[data-range]').forEach(button => button.addEventListener('click', () => { range = button.dataset.range; document.querySelectorAll('[data-range]').forEach(item => { item.classList.toggle('selected', item === button); item.setAttribute('aria-pressed', String(item === button)); }); if (marketConnected || connected) loadSelected(); }));
 document.querySelectorAll('[data-side]').forEach(button => button.addEventListener('click', () => { side = button.dataset.side; document.querySelectorAll('[data-side]').forEach(item => { item.classList.toggle('selected', item === button); item.setAttribute('aria-pressed', String(item === button)); }); message(''); updateEstimate(); }));
 $('order-form').addEventListener('submit', async event => {
   event.preventDefault();
@@ -420,7 +452,7 @@ $('connection-form').addEventListener('submit', async event => {
     if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Enter only the API origin, without credentials, paths, or query parameters.');
     if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) throw new Error('Use HTTPS for remote APIs. HTTP is supported only on localhost.');
     stopMarketStream(); streamTerminal = false; liveBars.clear();
-    apiBase = url.origin; apiToken = $('api-token').value.trim(); quotes = {}; account = null; connected = false;
+    apiBase = url.origin; apiToken = $('api-token').value.trim(); quotes = {}; account = null; connected = false; marketConnected = false;
     lastRefresh = null; currentBars = [];
     ['equity', 'cash', 'invested', 'buying-power', 'realized-pl', 'unrealized-pl', 'fill-count'].forEach(id => { $(id).textContent = '—'; });
     ['holdings-content', 'activity-content', 'trades-content'].forEach(id => { $(id).replaceChildren(element('p', 'Connecting to the selected account…', 'empty-state')); });
@@ -430,7 +462,9 @@ $('connection-form').addEventListener('submit', async event => {
     $('connection-dialog').close(); renderWatchlist(); renderQuote(); await refresh();
   } catch (error) { $('connection-error').textContent = error.message; }
 });
-$('refresh-data').addEventListener('click', () => { streamTerminal = false; if (streamRetryTimer) { clearTimeout(streamRetryTimer); streamRetryTimer = null; } refresh(); });
+function manualRefresh() { streamTerminal = false; if (streamRetryTimer) { clearTimeout(streamRetryTimer); streamRetryTimer = null; } refresh(); }
+$('refresh-data').addEventListener('click', manualRefresh);
+$('refresh-market').addEventListener('click', manualRefresh);
 function updateNavigation() {
   const hash = location.hash || '#overview';
   document.querySelectorAll('.nav-link').forEach(link => { const active = link.hash === hash; link.classList.toggle('active', active); if (active) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); });

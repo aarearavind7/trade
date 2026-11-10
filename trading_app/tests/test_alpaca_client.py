@@ -176,7 +176,7 @@ class ExtendedClientTests(unittest.TestCase):
 
 class ConfigurationTests(unittest.TestCase):
     def test_placeholder_or_whitespace_secret_is_not_accepted(self):
-        for secret in ('your_paper_secret_key', '  ', 'YOUR_SECRET'):
+        for secret in ('your_paper_secret_key', '  ', 'YOUR_SECRET', 'PASTE_YOUR_PAPER_SECRET_HERE'):
             with self.subTest(secret=secret), self.assertRaises(ValueError):
                 AlpacaClient(api_key='test-key', secret_key=secret)
 

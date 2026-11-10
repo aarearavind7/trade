@@ -19,6 +19,7 @@ from typing import Literal
 from .alpaca_client import AlpacaClient, AlpacaError
 from .service import OrderDraft, OrderStore, RiskLimits, TradeError, TradingService, fill_performance
 from .market_stream import MarketStream, stream_events
+from .public_market_data import PublicMarketData, PublicDataError
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,7 +29,7 @@ class SubmitRequest(BaseModel):
     review_id: UUID
 
 
-def create_app(broker=None, db_path=None, limits=None, access_token=None, allowed_origins=None):
+def create_app(broker=None, db_path=None, limits=None, access_token=None, allowed_origins=None, public_client=None):
     load_dotenv(ROOT / '.env')
     token = access_token if access_token is not None else os.getenv('API_ACCESS_TOKEN', '')
     origins = allowed_origins if allowed_origins is not None else [s.strip() for s in os.getenv('ALLOWED_ORIGINS', '').split(',') if s.strip()]
@@ -45,6 +46,8 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
     application = FastAPI(title='Trade Paper API', version='1.1.0', lifespan=lifespan, description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
     application.state.market_stream = None
     application.state.broker = broker
+    application.state.public_market_data = public_client or PublicMarketData()
+    public_enabled = os.getenv('PUBLIC_MARKET_DATA', 'true').strip().lower() in {'true', '1', 'yes'}
     application.state.store = store
     application.state.limits = limits
     hosts = [s.strip() for s in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,[::1],testserver').split(',')]
@@ -91,6 +94,18 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
             raise HTTPException(503, setup_message)
         return TradingService(configured_broker, store, limits)
 
+    def market_source(_=Depends(authorize)):
+        configured_broker, setup_message = broker_configuration()
+        if configured_broker is not None:
+            return 'alpaca', TradingService(configured_broker, store, limits)
+        if public_enabled:
+            return 'public', application.state.public_market_data
+        raise HTTPException(503, setup_message)
+
+    @application.exception_handler(PublicDataError)
+    async def public_data_error(request, exc):
+        return JSONResponse({'detail': str(exc), 'source': 'Yahoo Finance'}, status_code=502)
+
     @application.exception_handler(TradeError)
     async def trade_error(request, exc):
         return JSONResponse({'detail': exc.message}, status_code=exc.status)
@@ -111,7 +126,8 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         configured_broker, setup_message = broker_configuration()
         return {'status': 'ok', 'mode': 'paper', 'authentication_required': bool(token),
                 'broker_configured': configured_broker is not None, 'setup_message': setup_message,
-                'market_stream': True}
+                'market_stream': configured_broker is not None,
+                'public_market_data': public_enabled and configured_broker is None}
 
     @application.get('/favicon.ico', include_in_schema=False)
     def favicon():
@@ -128,8 +144,9 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         return svc.broker.positions()
 
     @application.get('/api/market/clock')
-    def clock(svc=Depends(service)):
-        return svc.broker.clock()
+    def clock(source=Depends(market_source)):
+        kind, data = source
+        return data.broker.clock() if kind == 'alpaca' else data.clock()
 
     @application.get('/api/market/stream')
     async def market_stream(request: Request, svc=Depends(service)):
@@ -140,20 +157,21 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
                                  headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})
 
     @application.get('/api/market/{symbol}/quote')
-    def quote(symbol: str, svc=Depends(service)):
+    def quote(symbol: str, source=Depends(market_source)):
         try:
             symbol = AlpacaClient.symbol(symbol)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
-        return svc.quote(symbol)
+        return source[1].quote(symbol)
 
     @application.get('/api/market/{symbol}/bars')
-    def bars(symbol: str, period: Literal['1D', '1W', '1M', '1Y'] = '1D', svc=Depends(service)):
+    def bars(symbol: str, period: Literal['1D', '1W', '1M', '1Y'] = '1D', source=Depends(market_source)):
         try:
             symbol = AlpacaClient.symbol(symbol)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
-        return svc.broker.bars(symbol, period)
+        kind, data = source
+        return data.broker.bars(symbol, period) if kind == 'alpaca' else data.bars(symbol, period)
 
     @application.get('/api/orders')
     def orders(svc=Depends(service)):

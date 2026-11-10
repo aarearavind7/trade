@@ -13,13 +13,13 @@ python -m pip install -r trading_app/requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` privately and replace `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET_KEY` with **paper** keys from Alpaca. The app loads `.env` automatically; never commit it. The server rejects live-trading or alternative API endpoints.
+To enable paper trading, edit `.env` privately and replace `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET_KEY` with **paper** keys from Alpaca. Prices and charts can be viewed without keys using the public market-data mode described below. The app loads `.env` automatically; never commit it. The server rejects live-trading or alternative API endpoints.
 
 ```bash
 uvicorn trading_app.api:app --host 127.0.0.1 --port 8000 --no-proxy-headers
 ```
 
-Open **http://localhost:8000**. Interactive API documentation is at **http://localhost:8000/docs**. A static `python -m http.server` alone cannot provide trading features. With no Alpaca credentials, the UI shows a configuration error and disables orders; it never substitutes fabricated balances or prices.
+Open **http://localhost:8000**. Interactive API documentation is at **http://localhost:8000/docs**. A static `python -m http.server` alone cannot provide trading features. With no Alpaca credentials, the UI shows real public prices and charts from Yahoo Finance and disables orders. Account-only panels are hidden; it never substitutes fabricated balances or prices.
 
 For a token-protected service, set `API_ACCESS_TOKEN` to a long random value, then use **Connect API** in the dashboard to enter the server URL and that application token. Never enter Alpaca keys in the browser. The app token is stored in the tab's session storage; an unfinished review ID and the API URL are stored locally for recovery.
 
@@ -30,9 +30,21 @@ If the dashboard loads (`GET /` returns 200) but account, positions, orders, and
 1. Stop Uvicorn with **Ctrl+C**.
 2. From the repository root, run `cp -n .env.example .env` to create the private file without overwriting an existing one.
 3. Open `.env` in IntelliJ. Replace both `your_paper_*` placeholders with your actual **paper** key and secret from your Alpaca paper account. Keep `ALPACA_TRADING_URL=https://paper-api.alpaca.markets`, `ALPACA_DATA_URL=https://data.alpaca.markets`, and `ALPACA_DATA_FEED=iex`.
-4. Restart Uvicorn, then refresh the browser. While setup is incomplete, the dashboard pauses automatic polling and disables orders. After correcting setup, use **Refresh** to retry.
+4. Restart Uvicorn, then refresh the browser. While setup is incomplete, orders remain disabled. With the default public fallback, prices and charts still load without keys; with `PUBLIC_MARKET_DATA=false`, the dashboard pauses automatic polling until setup is fixed. After correcting setup, use **Refresh** to retry.
 
 Never post `.env` or your keys in chat, screenshots, GitHub issues, or commits. Values already exported in the shell take precedence over `.env`; remove stale exported Alpaca variables from that shell before restarting if necessary. Invalid broker credentials or data permissions produce a separate upstream error after configuration succeeds.
+
+## Prices and charts without API keys
+
+Run the FastAPI app normally and open `http://127.0.0.1:8000`. When Alpaca credentials are missing or still placeholders, `PUBLIC_MARKET_DATA=true` (the default) enables a read-only Yahoo Finance view automatically. The watchlist and all chart ranges populate from public market data; there is no demo-price generator.
+
+The source and quote timestamps are shown. Public quote timing is **not verified**, so the UI says **may be delayed** and refreshes every 30 seconds rather than claiming a real-time stream. **Refresh prices** requests a manual refresh; chart responses are cached on the server for 15 seconds to reduce provider load. Public market-session status is only a provider-schedule estimate.
+
+This public chart endpoint is an external, unauthenticated service and can change, block requests, or rate-limit your server. In those cases the app displays a provider error; it does not generate replacement prices. Your server needs HTTPS access to `query1.finance.yahoo.com`. No Alpaca credentials are sent to Yahoo Finance.
+
+Balances, positions, P/L, and order history require an actual account and are hidden in market-only mode. Order submission, review, and Alpaca streaming remain disabled without a configured paper account. Public prices are never passed to the broker order/risk service. Once valid Alpaca configuration is loaded and the server restarted, the existing paper-trading and Alpaca streaming workflow applies. Syntactically configured but rejected Alpaca credentials still need to be corrected; broker authentication failures are not silently relabelled as public data.
+
+Set `PUBLIC_MARKET_DATA=false` to disable the public fallback and retain the setup-required screen until Alpaca credentials are available.
 
 ## Market data
 
@@ -88,7 +100,7 @@ Realized P/L uses **weighted-average cost accounting for long-only fills**, excl
 | GET | `/api/positions` | Broker positions, average cost, unrealized P/L. |
 | GET | `/api/market/clock` | Exchange clock and next open/close. |
 | GET | `/api/market/stream` | Authenticated SSE prices, minute bars, feed/connection status, and heartbeats. |
-| GET | `/api/market/{symbol}/quote` | Latest trade, timestamp, age, feed and delay label. |
+| GET | `/api/market/{symbol}/quote` | Timestamped Alpaca trade or read-only public quote when paper configuration is unavailable. |
 | GET | `/api/market/{symbol}/bars?period=1D` | Historical bars; also `1W`, `1M`, `1Y`. |
 | POST | `/api/orders/review` | Validate a draft and create a 60-second review. |
 | POST | `/api/orders` | Submit `{ "review_id": "..." }` idempotently. |
