@@ -437,6 +437,18 @@ function updateNavigation() {
   const active = document.querySelector('.nav-link.active'); document.querySelector('.breadcrumb b').textContent = active ? active.textContent.trim().split(' ').pop() : 'Overview';
 }
 window.addEventListener('hashchange', updateNavigation);
+const dateFormatter = new Intl.DateTimeFormat(undefined, {weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'});
+const clockFormatter = new Intl.DateTimeFormat(undefined, {hour: 'numeric', minute: '2-digit', second: '2-digit'});
+function updateLocalClock() {
+  const now = new Date();
+  $('current-date').textContent = dateFormatter.format(now);
+  $('current-time').textContent = clockFormatter.format(now);
+  $('current-date').setAttribute('datetime', now.toISOString());
+  $('current-time').setAttribute('datetime', now.toISOString());
+  $('current-timezone').textContent = dateFormatter.resolvedOptions().timeZone;
+}
+updateLocalClock();
+setInterval(updateLocalClock, 1000);
 selectStock(selected.symbol); renderWatchlist(); updateNavigation(); refresh();
 setInterval(() => { if (!configurationBlocked && !document.hidden && !$('review-dialog').open && !$('connection-dialog').open) refresh(); }, 30000);
 
