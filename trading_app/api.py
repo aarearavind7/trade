@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -67,13 +67,20 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         if token and not hmac.compare_digest(authorization or '', 'Bearer ' + token):
             raise HTTPException(401, 'Enter the application access token to connect. Never enter Alpaca API keys here.', headers={'WWW-Authenticate': 'Bearer'})
 
-    def service(_=Depends(authorize)):
+    def broker_configuration():
         if application.state.broker is None:
             try:
                 application.state.broker = AlpacaClient(feed=os.getenv('ALPACA_DATA_FEED', 'iex'))
             except ValueError as exc:
-                raise HTTPException(503, 'Configure Alpaca paper credentials and endpoints in the server environment.') from exc
-        return TradingService(application.state.broker, store, limits)
+                return None, ('Configure Alpaca paper trading: ' + str(exc) +
+                              ' Edit .env in the project root (beside .env.example), then restart Uvicorn and refresh this page.')
+        return application.state.broker, None
+
+    def service(_=Depends(authorize)):
+        configured_broker, setup_message = broker_configuration()
+        if setup_message:
+            raise HTTPException(503, setup_message)
+        return TradingService(configured_broker, store, limits)
 
     @application.exception_handler(TradeError)
     async def trade_error(request, exc):
@@ -92,7 +99,13 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
 
     @application.get('/api/health')
     def health():
-        return {'status': 'ok', 'mode': 'paper', 'authentication_required': bool(token)}
+        configured_broker, setup_message = broker_configuration()
+        return {'status': 'ok', 'mode': 'paper', 'authentication_required': bool(token),
+                'broker_configured': configured_broker is not None, 'setup_message': setup_message}
+
+    @application.get('/favicon.ico', include_in_schema=False)
+    def favicon():
+        return RedirectResponse('/favicon.svg')
 
     @application.get('/api/account')
     def account(svc=Depends(service)):

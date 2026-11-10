@@ -323,3 +323,34 @@ def test_incomplete_fills_and_corporate_actions_do_not_invent_realized_pl():
     assert not fill_performance(buys, [{'symbol': 'AAPL', 'qty': '20'}])['realized_complete']
     assert fill_performance([], [])['realized_pl'] == '0'
     assert fill_performance([], [], complete=False)['realized_pl'] is None
+
+
+def test_setup_health_avoids_errors_until_credentials_are_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv('ALPACA_API_KEY_ID', 'your_paper_api_key')
+    monkeypatch.setenv('ALPACA_API_SECRET_KEY', 'your_paper_secret_key')
+    app = create_app(db_path=tmp_path / 'setup.sqlite3', access_token='', allowed_origins=[])
+    with TestClient(app) as client:
+        response = client.get('/api/health')
+        assert response.status_code == 200
+        health = response.json()
+        assert not health['broker_configured']
+        assert 'ALPACA_API_KEY_ID' in health['setup_message']
+        assert '.env' in health['setup_message'] and 'restart Uvicorn' in health['setup_message']
+        assert 'your_paper_api_key' not in response.text
+        assert client.get('/api/account').status_code == 503
+        assert client.get('/favicon.ico').status_code == 200
+        assert client.get('/favicon.svg').headers['content-type'].startswith('image/svg+xml')
+        monkeypatch.setenv('ALPACA_API_KEY_ID', 'unit-test-key-not-a-real-secret')
+        monkeypatch.setenv('ALPACA_API_SECRET_KEY', 'unit-test-secret-not-a-real-secret')
+        assert client.get('/api/health').json()['broker_configured']
+
+
+def test_health_reports_invalid_endpoint_without_disclosing_credentials(tmp_path, monkeypatch):
+    monkeypatch.setenv('ALPACA_API_KEY_ID', 'unit-test-key')
+    monkeypatch.setenv('ALPACA_API_SECRET_KEY', 'unit-test-secret')
+    monkeypatch.setenv('ALPACA_TRADING_URL', 'https://api.alpaca.markets')
+    with TestClient(create_app(db_path=tmp_path / 'endpoint.sqlite3', access_token='', allowed_origins=[])) as client:
+        response = client.get('/api/health')
+        assert not response.json()['broker_configured']
+        assert 'official Alpaca paper-trading' in response.json()['setup_message']
+        assert 'unit-test-secret' not in response.text

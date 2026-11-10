@@ -172,3 +172,17 @@ class ExtendedClientTests(unittest.TestCase):
         with patch('trading_app.alpaca_client.urlopen', side_effect=error):
             self.assertEqual(429, session.request('GET', 'https://data.alpaca.markets').status_code)
         self.assertEqual({}, _Response(204, b'').json())
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_placeholder_or_whitespace_secret_is_not_accepted(self):
+        for secret in ('your_paper_secret_key', '  ', 'YOUR_SECRET'):
+            with self.subTest(secret=secret), self.assertRaises(ValueError):
+                AlpacaClient(api_key='test-key', secret_key=secret)
+
+    def test_copy_paste_whitespace_is_trimmed(self):
+        client = AlpacaClient(api_key=' test-key ', secret_key=' test-secret ',
+                              trading_url=' https://paper-api.alpaca.markets/ ')
+        self.assertEqual('test-key', client.api_key)
+        self.assertEqual('test-secret', client.secret_key)
+        self.assertEqual('https://paper-api.alpaca.markets', client.trading_url)

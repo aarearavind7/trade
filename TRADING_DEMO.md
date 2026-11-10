@@ -23,6 +23,17 @@ Open **http://localhost:8000**. Interactive API documentation is at **http://loc
 
 For a token-protected service, set `API_ACCESS_TOKEN` to a long random value, then use **Connect API** in the dashboard to enter the server URL and that application token. Never enter Alpaca keys in the browser. The app token is stored in the tab's session storage; an unfinished review ID and the API URL are stored locally for recovery.
 
+## Fix repeated 503 responses on first startup
+
+If the dashboard loads (`GET /` returns 200) but account, positions, orders, and market endpoints all return 503, the broker configuration has not initialized. Open `http://localhost:8000/api/health` to see `broker_configured` and a setup message. This check validates configuration without contacting Alpaca; `true` does not prove that Alpaca accepts your credentials.
+
+1. Stop Uvicorn with **Ctrl+C**.
+2. From the repository root, run `cp -n .env.example .env` to create the private file without overwriting an existing one.
+3. Open `.env` in IntelliJ. Replace both `your_paper_*` placeholders with your actual **paper** key and secret from your Alpaca paper account. Keep `ALPACA_TRADING_URL=https://paper-api.alpaca.markets`, `ALPACA_DATA_URL=https://data.alpaca.markets`, and `ALPACA_DATA_FEED=iex`.
+4. Restart Uvicorn, then refresh the browser. While setup is incomplete, the dashboard pauses automatic polling and disables orders. After correcting setup, use **Refresh** to retry.
+
+Never post `.env` or your keys in chat, screenshots, GitHub issues, or commits. Values already exported in the shell take precedence over `.env`; remove stale exported Alpaca variables from that shell before restarting if necessary. Invalid broker credentials or data permissions produce a separate upstream error after configuration succeeds.
+
 ## Market data
 
 - `ALPACA_DATA_FEED=iex` is the default. It provides exchange-specific IEX data, not the consolidated US market. Quote timestamps, feed coverage, and market open/closed status are visible.

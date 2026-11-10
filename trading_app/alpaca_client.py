@@ -52,12 +52,12 @@ class _UrllibSession:
 class AlpacaClient:
     def __init__(self, api_key=None, secret_key=None, trading_url=None, data_url=None,
                  session=None, timeout=15, feed='iex'):
-        self.api_key = api_key or os.getenv('ALPACA_API_KEY_ID')
-        self.secret_key = secret_key or os.getenv('ALPACA_API_SECRET_KEY')
-        if not self.api_key or not self.secret_key or self.api_key.startswith('your_'):
-            raise ValueError('Set ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY before running the demo.')
-        self.trading_url = (trading_url or os.getenv('ALPACA_TRADING_URL') or DEFAULT_TRADING_URL).rstrip('/')
-        self.data_url = (data_url or os.getenv('ALPACA_DATA_URL') or DEFAULT_DATA_URL).rstrip('/')
+        self.api_key = (api_key or os.getenv('ALPACA_API_KEY_ID') or '').strip()
+        self.secret_key = (secret_key or os.getenv('ALPACA_API_SECRET_KEY') or '').strip()
+        if any(not value or value.lower().startswith('your_') for value in (self.api_key, self.secret_key)):
+            raise ValueError('Replace ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY with your actual Alpaca paper keys.')
+        self.trading_url = (trading_url or os.getenv('ALPACA_TRADING_URL') or DEFAULT_TRADING_URL).strip().rstrip('/')
+        self.data_url = (data_url or os.getenv('ALPACA_DATA_URL') or DEFAULT_DATA_URL).strip().rstrip('/')
         # This application intentionally supports only the paper endpoint.
         if self.trading_url != DEFAULT_TRADING_URL or self.data_url != DEFAULT_DATA_URL:
             raise ValueError('Only the official Alpaca paper-trading and market-data endpoints are supported.')

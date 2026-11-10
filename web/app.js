@@ -16,6 +16,7 @@ let apiBase = storage.get('trade-api-base') || location.origin;
 let apiToken = storage.get('trade-api-token', true);
 let selected = STOCKS[0], side = 'buy', range = '1D', review = null;
 let connected = false, refreshing = false, submitting = false, selectionEpoch = 0;
+let configurationBlocked = false;
 let account = null, clock = null, quotes = {}, currentBars = [], lastRefresh = null;
 let pendingReview = storage.get(`trade-pending:${apiBase}`);
 
@@ -209,8 +210,17 @@ async function reconcileOrder(id, button) {
 async function refresh() {
   if (refreshing || submitting) return;
   refreshing = true; $('refresh-data').disabled = true;
-  const results = await Promise.allSettled([api('/api/account'), api('/api/positions'), api('/api/market/clock'), api('/api/orders'), api('/api/risk'), api('/api/performance'), api('/api/trades')]);
   try {
+    const health = await api('/api/health');
+    configurationBlocked = health.broker_configured === false;
+    if (configurationBlocked) {
+      connected = false; quotes = {}; currentBars = [];
+      $('market-status').textContent = 'Alpaca setup required';
+      banner(health.setup_message || 'Configure Alpaca paper keys in the server .env file, restart Uvicorn, then click Refresh.', true);
+      renderQuote(); renderChart(); renderWatchlist();
+      return;
+    }
+    const results = await Promise.allSettled([api('/api/account'), api('/api/positions'), api('/api/market/clock'), api('/api/orders'), api('/api/risk'), api('/api/performance'), api('/api/trades')]);
     connected = results.slice(0, 3).every(result => result.status === 'fulfilled');
     if (results[0].status === 'fulfilled') account = results[0].value;
     if (results[1].status === 'fulfilled' && account) renderAccount(results[1].value);
@@ -231,7 +241,7 @@ async function refresh() {
       await Promise.allSettled(STOCKS.map(async stock => { try { quotes[stock.symbol] = await api(`/api/market/${stock.symbol}/quote`); } catch { delete quotes[stock.symbol]; } }));
       renderWatchlist(); await loadSelected();
     }
-  } catch (error) { banner(error.message, true); }
+  } catch (error) { connected = false; banner(error.message, true); }
   finally { refreshing = false; $('refresh-data').disabled = false; updateEstimate(); }
 }
 
@@ -305,4 +315,4 @@ function updateNavigation() {
 }
 window.addEventListener('hashchange', updateNavigation);
 selectStock(selected.symbol); renderWatchlist(); updateNavigation(); refresh();
-setInterval(() => { if (!document.hidden && !$('review-dialog').open && !$('connection-dialog').open) refresh(); }, 30000);
+setInterval(() => { if (!configurationBlocked && !document.hidden && !$('review-dialog').open && !$('connection-dialog').open) refresh(); }, 30000);

@@ -18,12 +18,14 @@ async function boot(options = {}) {
   const storage = {getItem: key => saved.get(key) || null, setItem: (key, value) => saved.set(key, value)};
   const calls = [];
   let submitCount = 0;
+  let periodicRefresh;
   const date = new Date().toISOString();
   const fetch = async (url, init) => {
     const path = new URL(url).pathname; calls.push({path, init});
     let data;
     if (options.offline) throw new TypeError('Failed to fetch');
-    if (path === '/api/account') data = {cash: '90000', equity: '100000', buying_power: '180000'};
+    if (path === '/api/health') data = {broker_configured: options.configured !== false, setup_message: options.configured === false ? 'Configure Alpaca paper keys in .env, then restart Uvicorn.' : null};
+    else if (path === '/api/account') data = {cash: '90000', equity: '100000', buying_power: '180000'};
     else if (path === '/api/positions') data = [{symbol: 'AAPL', qty: '100', avg_entry_price: '90', current_price: '100', market_value: '10000', unrealized_pl: '1000'}];
     else if (path === '/api/market/clock') data = {is_open: true, timestamp: date};
     else if (path.endsWith('/quote')) data = {price: '100', timestamp: date, feed: 'iex', coverage: 'IEX exchange only', change_pct: '1.2', delayed: false};
@@ -43,12 +45,12 @@ async function boot(options = {}) {
     else throw new Error(`Unexpected API ${path}`);
     return new Response(JSON.stringify(data), {headers: {'Content-Type': 'application/json'}});
   };
-  const context = vm.createContext({window, document, Node: window.Node, location: {origin: 'http://localhost:8000', hash: ''}, localStorage: storage, sessionStorage: storage, URL, AbortController, fetch, console, setTimeout, clearTimeout, setInterval: () => 0});
+  const context = vm.createContext({window, document, Node: window.Node, location: {origin: 'http://localhost:8000', hash: ''}, localStorage: storage, sessionStorage: storage, URL, AbortController, fetch, console, setTimeout, clearTimeout, setInterval: callback => { periodicRefresh = callback; return 0; }});
   vm.runInContext(code, context);
   await flush();
   const click = async selector => { document.querySelector(selector).dispatchEvent(new window.Event('click')); await flush(); };
   const submit = async id => { $(id).dispatchEvent(new window.Event('submit', {cancelable: true})); await flush(); };
-  return {$, click, submit, calls, saved, window, context, options, get submitCount() { return submitCount; }};
+  return {$, click, submit, calls, saved, window, context, options, tick: async () => { periodicRefresh(); await flush(); }, get submitCount() { return submitCount; }};
 }
 
 test('dashboard renders broker balances, timestamps, holdings and performance', async () => {
@@ -112,4 +114,19 @@ test('API failure does not fall back to fake balances or enable trading', async 
   assert.equal(app.$('submit-order').disabled, true);
   assert.match(app.$('connection-status').textContent, /Failed to fetch/);
   assert.equal(app.$('chart-line').getAttribute('d'), '');
+});
+
+
+test('missing Alpaca setup shows instructions and stops failing API polls until a manual retry', async () => {
+  const app = await boot({configured: false});
+  assert.deepEqual(app.calls.map(call => call.path), ['/api/health']);
+  assert.match(app.$('connection-status').textContent, /Configure Alpaca paper keys/);
+  assert.equal(app.$('market-status').textContent, 'Alpaca setup required');
+  assert.equal(app.$('submit-order').disabled, true);
+  await app.tick(); await app.tick();
+  assert.equal(app.calls.length, 1);
+  app.options.configured = true;
+  await app.click('#refresh-data');
+  assert.equal(app.$('cash').textContent, '$90,000.00');
+  assert.equal(app.$('submit-order').disabled, false);
 });
