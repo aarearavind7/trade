@@ -1,0 +1,2 @@
+# The demo uses Python's standard library and has no third-party runtime dependencies.
+
