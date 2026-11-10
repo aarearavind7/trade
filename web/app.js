@@ -17,6 +17,7 @@ let apiToken = storage.get('trade-api-token', true);
 let selected = STOCKS[0], side = 'buy', range = '1D', review = null;
 let connected = false, refreshing = false, submitting = false, selectionEpoch = 0;
 let configurationBlocked = false, publicMarketMode = false, marketConnected = false;
+let connectionChecking = false, lastConnectionCheck = null;
 let streamSupported = false, streamController = null, streamRetryTimer = null, streamTerminal = false;
 let streamGeneration = 0, streamState = 'waiting', streamRetry = 1000, streamDetail = '';
 const liveBars = new Map();
@@ -42,14 +43,14 @@ function rememberPending(value) {
   storage.set(`trade-pending:${apiBase}`, value || '');
   updateEstimate();
 }
-async function api(path, {method = 'GET', body} = {}) {
+async function api(path, {method = 'GET', body, base = apiBase, accessToken = apiToken} = {}) {
   const headers = {'Accept': 'application/json'};
-  if (apiToken) headers.Authorization = `Bearer ${apiToken}`;
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
   if (body) headers['Content-Type'] = 'application/json';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), method === 'POST' ? 60000 : 30000);
   try {
-    const response = await fetch(`${apiBase}${path}`, {method, headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: 'omit'});
+    const response = await fetch(`${base}${path}`, {method, headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: 'omit'});
     if (!(response.headers.get('content-type') || '').includes('application/json')) throw new Error('No trading API at this address. Use Connect API to enter your FastAPI server URL.');
     const data = await response.json();
     if (!response.ok) {
@@ -442,17 +443,75 @@ $('confirm-order').addEventListener('click', async () => {
     submitting = false; $('cancel-review').disabled = false; updateEstimate(); await refresh();
   }
 });
-$('connect-api').addEventListener('click', () => { $('api-url').value = apiBase; $('api-token').value = apiToken; $('connection-error').textContent = ''; $('connection-dialog').showModal(); });
+function apiOrigin(value) {
+  const url = new URL(value);
+  if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Enter only the API origin, without credentials, paths, or query parameters.');
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) throw new Error('Use HTTPS for remote APIs. HTTP is supported only on localhost.');
+  return url.origin;
+}
+function connectionCheckRow(name, check) {
+  const labels = {connected: 'Connected', delayed: 'Check timing', not_configured: 'Optional', disabled: 'Disabled', error: 'Needs attention', unauthorized: 'Access denied', blocked: 'Restricted', checking: 'Checking…', not_checked: 'Not checked'};
+  const state = Object.hasOwn(labels, check.status) ? check.status : 'not_checked';
+  $(`check-${name}`).dataset.state = state;
+  $(`check-${name}-badge`).textContent = labels[state];
+  $(`check-${name}-message`).textContent = check.message || '';
+  $(`check-${name}-action`).textContent = check.action || '';
+}
+function showConnectionReport(report) {
+  connectionCheckRow('server', report.server);
+  connectionCheckRow('market', report.market_data);
+  connectionCheckRow('account', report.paper_account);
+  const pricesReady = ['connected', 'delayed'].includes(report.market_data.status);
+  const paperReady = report.paper_account.status === 'connected';
+  $('connection-summary').textContent = `${pricesReady ? 'Market prices are available.' : 'Market data needs attention.'} ${paperReady ? 'The paper account is connected.' : 'You can browse available prices while the paper account is disconnected.'}`;
+}
+async function checkConnection(force = true) {
+  if (connectionChecking) return null;
+  connectionChecking = true;
+  $('test-connection').disabled = true; $('save-connection').disabled = true;
+  $('connection-error').textContent = '';
+  try {
+    const origin = apiOrigin($('api-url').value), token = $('api-token').value.trim();
+    if (!force && lastConnectionCheck?.origin === origin && lastConnectionCheck.token === token && Date.now() - lastConnectionCheck.checkedAt < 30000) return lastConnectionCheck;
+    ['server', 'market', 'account'].forEach(name => connectionCheckRow(name, {status: 'checking', message: 'Checking read access…'}));
+    $('connection-summary').textContent = 'Checking the server and data sources. No orders will be submitted.';
+    const report = await api('/api/connection', {base: origin, accessToken: token});
+    if (report.service !== 'trade-paper-api' || !report.server || !report.market_data || !report.paper_account) throw new Error('This address is not a compatible Trade API. Pull the latest code, stop the old server, and run ./start.command.');
+    showConnectionReport(report);
+    lastConnectionCheck = {origin, token, report, checkedAt: Date.now()};
+    return lastConnectionCheck;
+  } catch (error) {
+    lastConnectionCheck = null;
+    connectionCheckRow('server', {status: error.status === 401 ? 'unauthorized' : 'error', message: error.message,
+      action: error.status === 401 ? 'Enter API_ACCESS_TOKEN from the server environment. This is not an Alpaca key.' : 'Start ./start.command, then open its printed browser address. For a hosted frontend, verify the API’s allowed origin.'});
+    ['market', 'account'].forEach(name => connectionCheckRow(name, {status: 'not_checked', message: 'Connect to the API before checking this step.'}));
+    $('connection-summary').textContent = 'Connection settings have not been saved. Fix the server address or access token and retry.';
+    $('connection-error').textContent = error.message;
+    return null;
+  } finally {
+    connectionChecking = false; $('test-connection').disabled = false; $('save-connection').disabled = false;
+  }
+}
+$('connect-api').addEventListener('click', () => {
+  $('api-url').value = apiBase; $('api-token').value = apiToken; $('connection-error').textContent = '';
+  if (lastConnectionCheck?.origin === apiBase && lastConnectionCheck.token === apiToken) showConnectionReport(lastConnectionCheck.report);
+  $('connection-dialog').showModal();
+});
+$('test-connection').addEventListener('click', () => checkConnection());
+$('use-local-api').addEventListener('click', () => {
+  $('api-url').value = 'http://127.0.0.1:8000'; $('api-token').value = ''; lastConnectionCheck = null;
+  $('connection-error').textContent = ''; $('connection-summary').textContent = 'Local server selected. Run ./start.command and click Check connection.';
+  ['server', 'market', 'account'].forEach(name => connectionCheckRow(name, {status: 'not_checked', message: 'Run the connection check.'}));
+});
 $('close-connection').addEventListener('click', () => $('connection-dialog').close());
 $('connection-form').addEventListener('submit', async event => {
   event.preventDefault();
   try {
-    if (submitting || refreshing) throw new Error('Wait for the current request to finish before changing connections.');
-    const url = new URL($('api-url').value);
-    if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Enter only the API origin, without credentials, paths, or query parameters.');
-    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) throw new Error('Use HTTPS for remote APIs. HTTP is supported only on localhost.');
+    if (submitting || refreshing || connectionChecking) throw new Error('Wait for the current request to finish before changing connections.');
+    const checked = await checkConnection(false);
+    if (!checked) return;
     stopMarketStream(); streamTerminal = false; liveBars.clear();
-    apiBase = url.origin; apiToken = $('api-token').value.trim(); quotes = {}; account = null; connected = false; marketConnected = false;
+    apiBase = checked.origin; apiToken = checked.token; quotes = {}; account = null; connected = false; marketConnected = false;
     lastRefresh = null; currentBars = [];
     ['equity', 'cash', 'invested', 'buying-power', 'realized-pl', 'unrealized-pl', 'fill-count'].forEach(id => { $(id).textContent = '—'; });
     ['holdings-content', 'activity-content', 'trades-content'].forEach(id => { $(id).replaceChildren(element('p', 'Connecting to the selected account…', 'empty-state')); });

@@ -27,6 +27,13 @@ async function boot(options = {}) {
     if (options.offline) throw new TypeError('Failed to fetch');
     if (path === '/api/health') data = {broker_configured: options.configured !== false, setup_message: options.configured === false ? 'Configure Alpaca paper keys in .env, then restart Uvicorn.' : null, market_stream: options.stream === true, public_market_data: options.publicData === true};
     else if (path === '/api/account') data = {cash: '90000', equity: '100000', buying_power: '180000'};
+    else if (path === '/api/connection') {
+      if (options.connectionUnauthorized) return new Response(JSON.stringify({detail: 'Enter the application access token'}), {status: 401, headers: {'Content-Type': 'application/json'}});
+      data = {service: options.wrongConnection ? 'other-service' : 'trade-paper-api',
+        server: {status: 'connected', message: 'API reachable', action: 'Keep Terminal open'},
+        market_data: {status: options.publicData ? 'delayed' : 'connected', message: 'Prices available', action: 'Check timestamps'},
+        paper_account: {status: options.configured === false ? 'not_configured' : 'connected', message: options.configured === false ? 'Paper account is optional' : 'Paper account active', action: 'Keys stay in .env'}};
+    }
     else if (path === '/api/market/stream') {
       const body = new ReadableStream({
         start(controller) {
@@ -216,4 +223,52 @@ test('without paper keys, real public market prices populate charts while accoun
   await app.click('#refresh-market');
   assert.ok(app.calls.filter(call => call.path === '/api/health').length >= 2);
   assert.equal(app.$('submit-order').disabled, true);
+});
+
+
+test('guided connection checks server, data and optional account without saving or submitting trades', async () => {
+  const app = await boot({configured: false, publicData: true});
+  await app.click('#connect-api');
+  await app.click('#test-connection');
+  assert.equal(app.$('check-server').dataset.state, 'connected');
+  assert.equal(app.$('check-market').dataset.state, 'delayed');
+  assert.equal(app.$('check-account').dataset.state, 'not_configured');
+  assert.match(app.$('connection-summary').textContent, /Market prices are available/);
+  assert.equal(app.saved.get('trade-api-base'), undefined);
+  assert.equal(app.submitCount, 0);
+  await app.submit('connection-form');
+  assert.equal(app.saved.get('trade-api-base'), 'http://localhost:8000');
+  assert.equal(app.$('connection-dialog').open, false);
+  assert.equal(app.calls.filter(call => call.path === '/api/connection').length, 1);
+});
+
+test('incorrect API addresses and application tokens are diagnosed without replacing working settings', async () => {
+  const app = await boot({wrongConnection: true});
+  await app.click('#connect-api');
+  app.$('api-url').value = 'https://wrong.example.com';
+  await app.submit('connection-form');
+  assert.equal(app.saved.get('trade-api-base'), undefined);
+  assert.match(app.$('connection-error').textContent, /not a compatible Trade API/);
+  assert.equal(app.$('connection-dialog').open, true);
+  app.options.wrongConnection = false;
+  app.options.connectionUnauthorized = true;
+  await app.click('#test-connection');
+  assert.equal(app.$('check-server').dataset.state, 'unauthorized');
+  assert.equal(app.$('check-market').dataset.state, 'not_checked');
+  assert.match(app.$('check-server-action').textContent, /API_ACCESS_TOKEN/);
+  assert.equal(app.saved.get('trade-api-base'), undefined);
+});
+
+test('local setup shortcut selects the correct server without transmitting stale tokens', async () => {
+  const app = await boot();
+  await app.click('#connect-api');
+  app.$('api-token').value = 'old-server-app-token';
+  await app.click('#use-local-api');
+  assert.equal(app.$('api-url').value, 'http://127.0.0.1:8000');
+  assert.equal(app.$('api-token').value, '');
+  const calls = app.calls.length;
+  app.$('api-url').value = 'http://remote.example.com';
+  await app.click('#test-connection');
+  assert.equal(app.calls.length, calls);
+  assert.match(app.$('connection-error').textContent, /HTTPS/);
 });

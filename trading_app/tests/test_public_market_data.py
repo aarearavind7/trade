@@ -121,3 +121,19 @@ def test_public_upstream_failure_returns_json_instead_of_fabricated_data(tmp_pat
         response = client.get('/api/market/AAPL/quote')
         assert response.status_code == 502 and response.json()['source'] == 'Yahoo Finance'
         assert 'price' not in response.json()
+
+
+def test_connection_guide_shows_optional_paper_keys_and_public_prices(tmp_path, monkeypatch):
+    monkeypatch.setenv('ALPACA_API_KEY_ID', '')
+    monkeypatch.setenv('ALPACA_API_SECRET_KEY', '')
+    monkeypatch.setenv('PUBLIC_MARKET_DATA', 'true')
+    with TestClient(create_app(db_path=tmp_path / 'guide.sqlite3', access_token='', allowed_origins=[], public_client=PublicMarketData(Opener()))) as client:
+        report = client.get('/api/connection').json()
+        assert report['server']['status'] == 'connected'
+        assert report['market_data']['status'] == 'delayed'
+        assert report['market_data']['provider'] == 'Yahoo Finance'
+        assert report['paper_account']['status'] == 'not_configured'
+    monkeypatch.setenv('PUBLIC_MARKET_DATA', 'false')
+    with TestClient(create_app(db_path=tmp_path / 'no-data.sqlite3', access_token='', allowed_origins=[])) as client:
+        report = client.get('/api/connection').json()
+        assert report['market_data']['status'] == 'disabled'

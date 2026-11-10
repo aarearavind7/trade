@@ -384,3 +384,42 @@ def test_sse_endpoint_content_type_and_auth_header(tmp_path, broker, monkeypatch
         assert result.headers['x-accel-buffering'] == 'no'
         assert 'connected' in result.text
         assert 'stream-app-token' not in result.text
+
+
+def test_connection_checks_verify_each_provider_without_exposing_account_data(client, broker):
+    report = client.get('/api/connection').json()
+    assert report['service'] == 'trade-paper-api'
+    assert report['server']['status'] == 'connected'
+    assert report['market_data']['status'] == 'connected'
+    assert report['paper_account']['status'] == 'connected'
+    assert 'cash' not in str(report) and 'paper-account' not in str(report)
+    assert broker.submissions == 0
+    assert client.get('/api/health').json()['service'] == 'trade-paper-api'
+
+
+def test_connection_checks_distinguish_rejected_credentials_and_market_access(client, broker):
+    broker.account = lambda: (_ for _ in ()).throw(AlpacaError('SECRET_MUST_NOT_APPEAR', 401))
+    report = client.get('/api/connection').json()
+    assert report['paper_account']['status'] == 'unauthorized'
+    assert report['market_data']['status'] == 'connected'
+    assert 'SECRET_MUST_NOT_APPEAR' not in str(report)
+    broker.snapshot = lambda symbol: (_ for _ in ()).throw(AlpacaError('SECRET_MUST_NOT_APPEAR', 403))
+    report = client.get('/api/connection').json()
+    assert report['market_data']['status'] == 'error'
+    assert 'SECRET_MUST_NOT_APPEAR' not in str(report)
+
+
+def test_connection_checks_show_restricted_accounts_and_stale_market_data(client, broker):
+    broker.account_data['trading_blocked'] = True
+    broker.quote_time -= timedelta(minutes=5)
+    report = client.get('/api/connection').json()
+    assert report['paper_account']['status'] == 'blocked'
+    assert report['market_data']['status'] == 'delayed'
+    broker.account = lambda: (_ for _ in ()).throw(AlpacaError('timeout'))
+    assert client.get('/api/connection').json()['paper_account']['status'] == 'error'
+
+
+def test_connection_checks_require_application_auth(tmp_path, broker):
+    with TestClient(create_app(broker, tmp_path / 'checks.sqlite3', access_token='private-app-token', allowed_origins=[])) as client:
+        assert client.get('/api/connection').status_code == 401
+        assert client.get('/api/connection', headers={'Authorization': 'Bearer private-app-token'}).status_code == 200

@@ -2,6 +2,35 @@
 
 A FastAPI backend and responsive dashboard for one Alpaca **paper account**. The dashboard reads broker balances, positions, timestamped market data, orders, fills, and equity history. Alpaca credentials stay on the Python server. Orders require an explicit review and confirmation.
 
+## Start on your Mac (recommended)
+
+Install Python 3.11 or newer once from python.org. In IntelliJ’s Terminal, from the project folder:
+
+```bash
+git pull origin main
+./start.command
+```
+
+You can also double-click **start.command** in Finder. The launcher finds a supported Python, creates the project `.venv` if needed, installs missing/changed runtime dependencies, and creates a private `.env` template only when one does not already exist. It preserves existing keys and trading state. The first setup may need internet access to download dependencies.
+
+The browser opens **after** the API is ready. Leave the launcher Terminal open; use **Ctrl+C** to stop it. Stop any older server first when applying backend updates. An already running compatible Trade server is reused; an unrelated process on the port is reported without being stopped.
+
+If the port is occupied, use `./start.command --port 8001`. To suppress browser opening, add `--no-browser`. If the executable permission was lost while copying files, run `chmod +x start.command` once. Python older than 3.11 and older existing virtual environments produce setup instructions rather than being deleted automatically.
+
+## Guided connection setup
+
+Click **Connection setup** in the dashboard header. Choose **Use local server** for `http://127.0.0.1:8000`, or enter the address printed by your launcher if you selected another port. A hosted API can still use its own HTTPS origin.
+
+**Check connection** performs three read-only checks:
+
+1. **API server:** confirms the address is this application and validates any app access token.
+2. **Market data:** requests a timestamped AAPL quote from the selected source and reports data availability or uncertain/stale timing.
+3. **Paper account (optional):** verifies paper-account access and reports inactive or restricted accounts separately from a market-data failure.
+
+Each result includes a next action. These checks never submit orders and do not return brokerage credentials, account identifiers, or balances. The screen accepts only the optional **application access token**; brokerage keys remain in the server’s `.env`. No API settings are saved unless the Trade API responds to the check and you click **Connect workspace**. Provider/account warnings can remain visible even when the API connection itself succeeds.
+
+For a local server, open the launcher’s own dashboard address directly. A hosted frontend connecting to another origin also needs the explicit CORS configuration described below. Public market prices remain usable without a paper account; the setup screen explains how to enable paper orders when you are ready.
+
 ## Run locally
 
 Requires Python 3.11+; Node.js 22+ is needed only for dashboard tests.
@@ -95,7 +124,8 @@ Realized P/L uses **weighted-average cost accounting for long-only fills**, excl
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/health` | Service status and application-auth requirement. |
+| GET | `/api/health` | Service identity, configuration status, and application-auth requirement (no provider requests). |
+| GET | `/api/connection` | Authenticated read-only server, market-data, and paper-account connection checks. |
 | GET | `/api/account` | Paper-account balances and status. |
 | GET | `/api/positions` | Broker positions, average cost, unrealized P/L. |
 | GET | `/api/market/clock` | Exchange clock and next open/close. |
@@ -146,12 +176,12 @@ The container runs as an unprivileged user. `.env`, local state, Git metadata, a
 
 ```bash
 python -m pip install -r trading_app/requirements-dev.txt
-python -m pytest trading_app/tests --cov=trading_app --cov-report=term-missing --cov-fail-under=80
+python -m pytest trading_app/tests --cov=trading_app --cov=scripts.start_local --cov-report=term-missing --cov-fail-under=80
 npm ci --prefix web
 npm test --prefix web
 ```
 
-Tests use mocked broker responses and browser DOM/network adapters; they never contact Alpaca. They cover order validation, duplicate/concurrent submissions, crash and timeout recovery, risk reservations, quote staleness, API authorization/failures, fill accounting, review/confirmation, browser recovery after uncertain submissions, shared stream connections, reconnection/denials, fragmented SSE parsing, and stale snapshot protection.
+Tests use mocked broker responses and browser DOM/network adapters; they never contact Alpaca. They cover order validation, duplicate/concurrent submissions, crash and timeout recovery, risk reservations, quote staleness, API authorization/failures, fill accounting, review/confirmation, browser recovery after uncertain submissions, shared stream connections, reconnection/denials, fragmented SSE parsing, stale snapshot protection, connection diagnostics, rejected settings, launcher setup, port conflicts, and orderly startup/shutdown.
 
 `.github/workflows/trading-tests.yml` runs the Python suite on 3.11, 3.12, and 3.13 with an 80% coverage floor, checks JavaScript syntax, and runs dashboard tests. Existing repository-validation workflows remain in place. DOM tests do not replace full visual browser testing or an integration check with your own paper account.
 

@@ -2,6 +2,8 @@
 import hmac
 import os
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -43,7 +45,7 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         if application.state.market_stream is not None:
             await application.state.market_stream.close()
 
-    application = FastAPI(title='Trade Paper API', version='1.1.0', lifespan=lifespan, description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
+    application = FastAPI(title='Trade Paper API', version='1.2.0', lifespan=lifespan, description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
     application.state.market_stream = None
     application.state.broker = broker
     application.state.public_market_data = public_client or PublicMarketData()
@@ -124,10 +126,57 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
     @application.get('/api/health')
     def health():
         configured_broker, setup_message = broker_configuration()
-        return {'status': 'ok', 'mode': 'paper', 'authentication_required': bool(token),
+        return {'status': 'ok', 'service': 'trade-paper-api', 'mode': 'paper', 'authentication_required': bool(token),
                 'broker_configured': configured_broker is not None, 'setup_message': setup_message,
                 'market_stream': configured_broker is not None,
                 'public_market_data': public_enabled and configured_broker is None}
+
+    @application.get('/api/connection')
+    def connection(_=Depends(authorize)):
+        """Probe read access only. Never expose credentials, balances, or submit orders."""
+        configured_broker, setup_message = broker_configuration()
+
+        def check_account():
+            if configured_broker is None:
+                return {'status': 'not_configured', 'message': 'Paper trading is optional. No paper account is configured.',
+                        'action': 'For orders, add your Alpaca paper key and secret to .env in IntelliJ. Restart the launcher after saving. Keep keys on the server.'}
+            try:
+                account = configured_broker.account()
+                if not isinstance(account, dict):
+                    raise TradeError('Invalid account response.', 502)
+                blocked = account.get('status') != 'ACTIVE' or any(account.get(key) for key in ('trading_blocked', 'account_blocked', 'trade_suspended_by_user'))
+                return {'status': 'blocked' if blocked else 'connected',
+                        'message': 'Alpaca responded, but this account is blocked from trading.' if blocked else 'Alpaca accepted the paper credentials and the account is active.',
+                        'action': 'Review account restrictions in your Alpaca paper dashboard.' if blocked else 'Orders still require review and confirmation. Market hours and risk limits apply.'}
+            except (AlpacaError, TradeError) as exc:
+                denied = isinstance(exc, AlpacaError) and exc.status_code in {401, 403}
+                return {'status': 'unauthorized' if denied else 'error',
+                        'message': 'Alpaca rejected paper-account access.' if denied else 'The paper account could not be reached or returned invalid data.',
+                        'action': 'Verify paper keys in .env and restart the launcher. Live-account keys do not work here.' if denied else 'Check internet access and Alpaca availability, then run the checks again.'}
+
+        def check_market():
+            if configured_broker is None and not public_enabled:
+                return {'status': 'disabled', 'message': 'No market-data source is enabled.',
+                        'action': 'Set PUBLIC_MARKET_DATA=true in .env for prices without keys, or configure Alpaca paper keys. Restart the launcher.'}
+            try:
+                data = TradingService(configured_broker, store, limits) if configured_broker else application.state.public_market_data
+                quote = data.quote('AAPL')
+                delayed = quote.get('delayed') or quote.get('timing_verified') is False
+                return {'status': 'delayed' if delayed else 'connected', 'provider': quote.get('source') or quote.get('coverage') or quote.get('feed'),
+                        'timestamp': quote.get('timestamp'),
+                        'message': 'Prices are available; the latest trade is stale or timing is not verified.' if delayed else 'Timestamped market prices are available.',
+                        'action': 'Check the displayed quote time. Public prices may be delayed; inactive markets do not produce new trades.' if delayed else 'Watchlist prices and charts can load. Alpaca stream access is shown separately on the dashboard.'}
+            except (AlpacaError, PublicDataError, TradeError):
+                return {'status': 'error', 'message': 'The selected market-data source did not return a usable quote.',
+                        'action': 'Check internet access, provider availability, and Alpaca data entitlements if configured. Wait before retrying a rate-limited public source.'}
+
+        with ThreadPoolExecutor(max_workers=2) as checks:
+            account_result = checks.submit(check_account)
+            market_result = checks.submit(check_market)
+            return {'service': 'trade-paper-api', 'checked_at': datetime.now(timezone.utc).isoformat(),
+                    'server': {'status': 'connected', 'message': 'The Trade API is reachable and application access is accepted.',
+                               'action': 'Keep the launcher Terminal open while using the app.'},
+                    'market_data': market_result.result(), 'paper_account': account_result.result()}
 
     @application.get('/favicon.ico', include_in_schema=False)
     def favicon():

@@ -18,10 +18,22 @@ jobs:
           cache: pip
           cache-dependency-path: trading_app/requirements*.txt
       - run: python -m pip install -r trading_app/requirements-dev.txt
-      - run: python -m pytest trading_app/tests --cov=trading_app --cov-report=term-missing --cov-fail-under=80
+      - run: python -m pytest trading_app/tests --cov=trading_app --cov=scripts.start_local --cov-report=term-missing --cov-fail-under=80
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - run: bash -n start.command
       - run: node --check web/app.js
       - run: npm ci --prefix web
       - run: npm test --prefix web
+
+  macos-launcher:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r trading_app/requirements-dev.txt
+      - run: bash -n start.command
+      - run: python -m pytest trading_app/tests/test_launcher.py -q

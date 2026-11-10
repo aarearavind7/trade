@@ -25,7 +25,7 @@
     </div>
   </aside>
   <div class="main-shell">
-    <header class="topbar"><span class="breadcrumb">Workspace <span>/</span> <b>Overview</b></span><div class="topbar-right"><button class="text-button" id="connect-api" type="button">Connect API</button><span class="paper-badge" id="account-status"><i></i> Paper trading</span><a href="https://github.com/aarearavind7/trade" target="_blank" rel="noopener" aria-label="View source on GitHub">GitHub ↗</a></div></header>
+    <header class="topbar"><span class="breadcrumb">Workspace <span>/</span> <b>Overview</b></span><div class="topbar-right"><button class="text-button" id="connect-api" type="button">Connection setup</button><span class="paper-badge" id="account-status"><i></i> Paper trading</span><a href="https://github.com/aarearavind7/trade" target="_blank" rel="noopener" aria-label="View source on GitHub">GitHub ↗</a></div></header>
     <main id="overview">
       <div class="heading-row"><div><div class="eyebrow">MAKE ROOM FOR YOUR NEXT MOVE</div><h1>Your market. Your momentum.</h1><p>A clear view of your portfolio. A little closer to your goals.</p><p class="local-clock" aria-label="Your local date and time"><time id="current-date">Loading date…</time><span aria-hidden="true">·</span><time id="current-time"></time><span id="current-timezone"></span></p></div><span class="demo-label" id="market-status">Connecting…</span></div>
       <div class="connection-banner" id="connection-status" role="status" aria-live="polite">Connecting to the paper-trading API…</div><section class="stats-grid requires-account" aria-label="Account summary">
@@ -53,7 +53,26 @@
       <section class="panel trade-history requires-account"><div class="panel-heading"><h2>Trade history</h2><span class="subtle">Latest 100 broker fills</span></div><div id="trades-content"></div></section><footer><span><b>trade.</b> A space to build your edge.</span><span id="data-disclaimer">Alpaca paper trading · IEX prices may differ from the consolidated market.</span></footer>
     </main>
   </div>
-  <dialog id="connection-dialog" aria-labelledby="connection-title"><form id="connection-form"><h2 id="connection-title">Connect your paper API</h2><p>Run the FastAPI service locally or deploy it to a Python host. Alpaca keys belong in that server’s environment.</p><label for="api-url">API base URL</label><input id="api-url" type="url" placeholder="https://your-api.example.com" required><label for="api-token">Application access token</label><input id="api-token" type="password" autocomplete="off" placeholder="API_ACCESS_TOKEN (optional on localhost)"><small>Use the app token, never your Alpaca key or secret. The token stays in this browser tab’s session.</small><p id="connection-error" role="alert"></p><div class="dialog-actions"><button class="secondary-button" id="close-connection" type="button">Cancel</button><button class="submit-order" type="submit">Connect</button></div></form></dialog>
+  <dialog id="connection-dialog" class="setup-dialog" aria-labelledby="connection-title">
+    <form id="connection-form">
+      <div class="eyebrow">LET’S GET YOU CONNECTED</div><h2 id="connection-title">Your workspace, ready to go.</h2>
+      <p>Check the server, market prices, and optional paper account in one place.</p>
+      <div class="setup-launch"><strong>Starting on your Mac?</strong><p>Double-click <code>start.command</code> in the project folder, or run <code>./start.command</code> in IntelliJ’s Terminal. The launcher opens the dashboard when it is ready.</p><a href="http://127.0.0.1:8000" target="_blank" rel="noopener">Open the local dashboard ↗</a></div>
+      <label for="api-url">Trade API address</label><input id="api-url" type="url" placeholder="http://127.0.0.1:8000" required>
+      <label for="api-token">Application access token</label><input id="api-token" type="password" autocomplete="off" placeholder="Optional unless API_ACCESS_TOKEN is set on the server">
+      <small>This is the app access token, never an Alpaca key or secret. Paper keys stay in the server’s .env file.</small>
+      <div class="setup-tools"><button class="secondary-button" id="use-local-api" type="button">Use local server</button><button class="secondary-button" id="test-connection" type="button">Check connection</button></div>
+      <div class="setup-checks" aria-label="Connection checks">
+        <article class="setup-check" id="check-server" data-state="not_checked"><span class="setup-number">1</span><div><h3>API server</h3><p id="check-server-message">Check that this address runs the Trade API.</p><small id="check-server-action">Keep the launcher Terminal open while using the app.</small></div><span class="setup-badge" id="check-server-badge">Not checked</span></article>
+        <article class="setup-check" id="check-market" data-state="not_checked"><span class="setup-number">2</span><div><h3>Market data</h3><p id="check-market-message">Verify that the selected provider returns a timestamped price.</p><small id="check-market-action">Public prices work without paper keys and may be delayed.</small></div><span class="setup-badge" id="check-market-badge">Not checked</span></article>
+        <article class="setup-check" id="check-account" data-state="not_checked"><span class="setup-number">3</span><div><h3>Paper account <span class="subtle">optional</span></h3><p id="check-account-message">Check paper credentials and account restrictions.</p><small id="check-account-action">You can browse market data without connecting an account.</small></div><span class="setup-badge" id="check-account-badge">Not checked</span></article>
+      </div>
+      <p id="connection-summary" class="setup-summary" role="status" aria-live="polite">Run the checks to see what is ready and what needs attention.</p>
+      <details class="setup-help"><summary>How do I enable paper orders?</summary><ol><li>Generate keys in your <a href="https://app.alpaca.markets/" target="_blank" rel="noopener">Alpaca paper account ↗</a>.</li><li>Open the project’s <code>.env</code> file in IntelliJ and replace <code>ALPACA_API_KEY_ID</code> and <code>ALPACA_API_SECRET_KEY</code> with your paper keys.</li><li>Save, stop the launcher with Ctrl+C, and run <code>./start.command</code> again. Then check the connection.</li></ol><p>Use the paper endpoint. Keep .env private; this screen never asks for brokerage keys.</p></details>
+      <p id="connection-error" role="alert"></p>
+      <div class="dialog-actions"><button class="secondary-button" id="close-connection" type="button">Cancel</button><button class="submit-order" id="save-connection" type="submit">Connect workspace</button></div>
+    </form>
+  </dialog>
   <dialog id="review-dialog" aria-labelledby="review-title"><div class="review-body"><h2 id="review-title">Review paper order</h2><p>Check the details before sending this order to Alpaca.</p><dl id="review-details"></dl><p id="review-expiry"></p><p id="review-error" role="alert"></p><div class="dialog-actions"><button class="secondary-button" id="cancel-review" type="button">Back</button><button class="submit-order" id="confirm-order" type="button">Confirm paper order</button></div></div></dialog>
 </body>
 </html>
