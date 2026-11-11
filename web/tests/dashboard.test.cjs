@@ -5,13 +5,14 @@ const vm = require('node:vm');
 const {parseHTML} = require('linkedom');
 const html = fs.readFileSync(`${__dirname}/../index.html`, 'utf8');
 const code = fs.readFileSync(`${__dirname}/../app.js`, 'utf8');
+const alertsCode = fs.readFileSync(`${__dirname}/../price-alerts.js`, 'utf8');
 const REVIEW_ID = 'e4de82d3-9e39-4c15-a435-de206852b186';
 const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(resolve => setImmediate(resolve)); };
 
 async function boot(options = {}) {
   const {window, document} = parseHTML(html);
   const $ = id => document.getElementById(id);
-  for (const [id, value] of [['symbol', 'AAPL'], ['order-type', 'market'], ['watchlist-page-select', '0']]) Object.defineProperty($(id), 'value', {writable: true, value});
+  for (const [id, value] of [['symbol', 'AAPL'], ['order-type', 'market'], ['watchlist-page-select', '0'], ['alert-symbol', 'AAPL'], ['alert-condition', 'above']]) Object.defineProperty($(id), 'value', {writable: true, value});
   window.HTMLElement.prototype.showModal = function () { this.open = true; };
   window.HTMLElement.prototype.close = function () { this.open = false; };
   const saved = options.saved || new Map();
@@ -60,7 +61,7 @@ async function boot(options = {}) {
     }
     else if (path === '/api/positions') data = [{symbol: 'AAPL', qty: '100', avg_entry_price: '90', current_price: '100', market_value: '10000', unrealized_pl: '1000'}];
     else if (path === '/api/market/clock') data = {is_open: true, timestamp: date, schedule_available: true};
-    else if (path.endsWith('/quote')) data = {price: '100', timestamp: date, feed: options.publicData ? 'public' : 'iex', coverage: options.publicData ? 'Yahoo Finance' : 'IEX exchange only', change_pct: '1.2', delayed: !!options.publicData, timing_verified: !options.publicData};
+    else if (path.endsWith('/quote')) data = {price: '100', timestamp: date, feed: options.publicData ? 'public' : 'iex', coverage: options.publicData ? 'Yahoo Finance' : 'IEX exchange only', change_pct: '1.2', delayed: !!options.publicData, timing_verified: !options.publicData, ...(options.marketQuotes?.[path.split('/').at(-2)] || {})};
     else if (path.endsWith('/bars')) data = {bars: [{c: 99, t: new Date(Math.floor(Date.now() / 60000) * 60000 - 60000).toISOString()}, {c: 100, t: new Date(Math.floor(Date.now() / 60000) * 60000).toISOString()}], delay_minutes: options.publicData ? null : 16, source: options.publicData ? 'Yahoo Finance' : undefined};
     else if (path === '/api/risk') data = {max_position_pct: '20', max_order_notional: '5000', max_daily_loss: '1000', daily_loss: '0', basis: 'Previous close'};
     else if (path === '/api/performance') data = {realized_pl: '200', unrealized_pl: '1000', fill_count: 3, realized_complete: true, method: 'Weighted-average fills', portfolio_history: {timestamp: [1, 2], equity: [99000, 100000]}};
@@ -77,7 +78,8 @@ async function boot(options = {}) {
     else throw new Error(`Unexpected API ${path}`);
     return new Response(JSON.stringify(data), {headers: {'Content-Type': 'application/json'}});
   };
-  const context = vm.createContext({window, document, Node: window.Node, location: {origin: 'http://localhost:8000', hash: ''}, localStorage: storage, sessionStorage: storage, URL, AbortController, TextDecoder, fetch, console, setTimeout, clearTimeout, setInterval: callback => { periodicRefresh.push(callback); return 0; }});
+  const context = vm.createContext({window, document, Node: window.Node, location: {origin: 'http://localhost:8000', hash: ''}, localStorage: storage, sessionStorage: storage, URL, AbortController, TextDecoder, navigator: options.navigator, fetch, console, setTimeout, clearTimeout, setInterval: callback => { periodicRefresh.push(callback); return 0; }});
+  vm.runInContext(alertsCode, context);
   vm.runInContext(code, context);
   await flush();
   const click = async selector => { document.querySelector(selector).dispatchEvent(new window.Event('click')); await flush(); };
@@ -433,4 +435,105 @@ test('large watchlist streams are bounded to the selected page', async () => {
     assert.ok(!symbols.includes('AAPL'));
     assert.equal(app.$('symbol').value, symbols[0]);
   } finally { await app.close(); }
+});
+
+async function createPriceAlert(app, target = '105', condition = 'above', symbol) {
+  await app.click('#new-price-alert');
+  if (symbol) { app.$('alert-symbol').value = symbol; app.$('alert-symbol').dispatchEvent(new app.window.Event('change')); await flush(); }
+  app.$('alert-condition').value = condition; app.$('alert-target').value = target;
+  await app.submit('price-alert-form');
+}
+
+test('a live target hit creates one persistent in-app notification and never submits an order', async () => {
+  const app = await boot({stream: true});
+  try {
+    await createPriceAlert(app);
+    assert.equal(app.$('price-alert-dialog').open, false);
+    assert.match(app.$('price-alerts-list').textContent, /active/);
+    assert.equal(app.$('notification-count').textContent, '0');
+    const event = {type: 'quote', symbol: 'AAPL', price: '105', timestamp: new Date(Date.now() + 10).toISOString(), feed: 'iex', coverage: 'IEX exchange only', delayed: false};
+    await app.emit(event);
+    assert.equal(app.$('notification-count').textContent, '1');
+    assert.match(app.$('alert-toasts').textContent, /AAPL at or above \$105.00/);
+    assert.equal(app.$('alert-toasts').children.length, 1);
+    await app.emit({...event, price: '106', timestamp: new Date(Date.now() + 20).toISOString()});
+    assert.equal(app.$('notification-count').textContent, '1');
+    const restored = await boot({saved: app.saved});
+    assert.equal(restored.$('notification-count').textContent, '1');
+    assert.equal(restored.$('alert-toasts').children.length, 0);
+    await restored.click('#open-notifications');
+    assert.match(restored.$('notification-list').textContent, /IEX exchange only/);
+    await restored.click('#mark-notifications-read');
+    assert.equal(restored.$('notification-count').hidden, true);
+    assert.ok(JSON.parse(restored.saved.get('trade-price-alerts-v1')).notifications.every(item => item.read));
+    assert.equal(app.submitCount, 0);
+  } finally { await app.close(); }
+});
+
+test('pause, resume, delete and duplicate target validation work through the alert controls', async () => {
+  const app = await boot({stream: true});
+  try {
+    await createPriceAlert(app);
+    await createPriceAlert(app);
+    assert.match(app.$('price-alert-error').textContent, /already/);
+    await app.click('#cancel-price-alert');
+    await app.click('[data-alert-toggle]');
+    assert.match(app.$('price-alerts-list').textContent, /paused/);
+    await app.emit({type: 'quote', symbol: 'AAPL', price: '106', timestamp: new Date(Date.now() + 10).toISOString(), feed: 'iex', coverage: 'IEX exchange only'});
+    assert.equal(app.$('notification-count').textContent, '0');
+    await app.click('[data-alert-toggle]');
+    assert.match(app.$('price-alerts-list').textContent, /active/);
+    await app.emit({type: 'quote', symbol: 'AAPL', price: '107', timestamp: new Date(Date.now() + 20).toISOString(), feed: 'iex', coverage: 'IEX exchange only'});
+    assert.equal(app.$('notification-count').textContent, '1');
+    await app.click('[data-alert-delete]');
+    assert.equal(JSON.parse(app.saved.get('trade-price-alerts-v1')).alerts.length, 0);
+    assert.equal(app.$('price-alert-count').textContent, '0');
+  } finally { await app.close(); }
+});
+
+test('off-page and removed stocks remain monitored by bounded public quote polling', async () => {
+  const app = await boot({configured: false, publicData: true});
+  await app.click('#add-sp500');
+  await createPriceAlert(app, '105', 'above', 'S400');
+  app.$('symbol').value = 'S400'; app.$('symbol').dispatchEvent(new app.window.Event('change')); await flush();
+  await app.click('[data-remove-stock="S400"]');
+  assert.ok(!JSON.parse(app.saved.get('trade-watchlist-v1')).some(item => item.symbol === 'S400'));
+  app.options.marketQuotes = {S400: {price: '110', timestamp: new Date(Date.now() + 10).toISOString()}};
+  const before = app.calls.length;
+  await app.tick();
+  assert.ok(app.calls.slice(before).some(call => call.path === '/api/market/S400/quote'));
+  assert.equal(app.$('notification-count').textContent, '1');
+  await app.click('#open-notifications');
+  assert.match(app.$('notification-list').textContent, /may be delayed/);
+  assert.equal(app.submitCount, 0);
+});
+
+test('already displayed quotes do not fire on creation, and invalid or unsaved alerts have clear feedback', async () => {
+  const app = await boot({configured: false, publicData: true});
+  await createPriceAlert(app, '90');
+  assert.equal(app.$('notification-count').textContent, '0');
+  assert.equal(app.$('alert-toasts').children.length, 0);
+  await app.click('#new-price-alert'); app.$('alert-target').value = '1.23456'; await app.submit('price-alert-form');
+  assert.match(app.$('price-alert-error').textContent, /four decimal/);
+  const blocked = await boot({storageFailure: true, configured: false, publicData: true});
+  await createPriceAlert(blocked);
+  assert.match(blocked.$('alerts-action-status').textContent, /session only/);
+});
+
+
+test('same-origin tabs share a single persisted trigger through the Web Locks path', async () => {
+  let chain = Promise.resolve();
+  const navigator = {locks: {request(name, action) { const work = chain.then(action); chain = work.catch(() => {}); return work; }}};
+  const saved = new Map();
+  const one = await boot({saved, stream: true, navigator});
+  let two;
+  try {
+    await createPriceAlert(one);
+    two = await boot({saved, stream: true, navigator});
+    const event = {type: 'quote', symbol: 'AAPL', price: '106', timestamp: new Date(Date.now() + 10).toISOString(), feed: 'iex', coverage: 'IEX exchange only'};
+    await Promise.all([one.emit(event), two.emit(event)]);
+    await chain; await flush();
+    assert.equal(JSON.parse(saved.get('trade-price-alerts-v1')).notifications.length, 1);
+    assert.equal(one.$('alert-toasts').children.length + two.$('alert-toasts').children.length, 1);
+  } finally { await one.close(); if (two) await two.close(); }
 });

@@ -24,6 +24,7 @@ jobs:
           node-version: '22'
       - run: bash -n start.command
       - run: node --check web/app.js
+      - run: node --check web/price-alerts.js
       - run: npm ci --prefix web
       - run: npm test --prefix web
 

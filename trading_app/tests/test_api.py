@@ -100,6 +100,7 @@ def reviewed(client, **changes):
 def test_market_account_and_static_endpoints(client):
     assert client.get('/').status_code == 200
     assert client.get('/app.js').status_code == 200
+    assert client.get('/price-alerts.js').status_code == 200
     assert client.get('/api/health').json()['mode'] == 'paper'
     assert client.get('/api/account').json()['cash'] == '100000'
     assert client.get('/api/positions').json() == []

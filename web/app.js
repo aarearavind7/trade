@@ -80,6 +80,13 @@ let streamGeneration = 0, streamState = 'waiting', streamRetry = 1000, streamDet
 const liveBars = new Map();
 let account = null, clock = null, quotes = {}, currentBars = [], lastRefresh = null;
 let pendingReview = storage.get(`trade-pending:${apiBase}`);
+const PRICE_ALERTS_KEY = 'trade-price-alerts-v1';
+let alertsSavedRaw = storage.get(PRICE_ALERTS_KEY);
+let priceAlerts = new TradePriceAlerts.AlertBook(alertsSavedRaw);
+let alertsMonitoring = false, alertsStorageFailed = false, alertReferenceEpoch = 0, alertReference = null;
+const alertQuoteFailures = new Set();
+const alertMoney = value => new Intl.NumberFormat('en-US', {style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 6}).format(Number(value));
+
 
 function element(tag, text, className) {
   const el = document.createElement(tag);
@@ -303,6 +310,7 @@ async function reconcileOrder(id, button) {
   finally { if (button) button.disabled = false; }
 }
 function saveSnapshot(symbol, snapshot) {
+  receiveAlertQuote(symbol, snapshot);
   if (!STOCKS.some(stock => stock.symbol === symbol)) return;
   const existing = quotes[symbol];
   if (!existing || new Date(snapshot.timestamp) >= new Date(existing.timestamp)) quotes[symbol] = snapshot;
@@ -344,6 +352,7 @@ function handleMarketEvent(event) {
     if (!Number.isFinite(Number(event.price)) || Number(event.price) <= 0 || !Number.isFinite(new Date(event.timestamp).getTime())) return;
     if (old && new Date(event.timestamp) < new Date(old.timestamp)) return;
     const previous = old?.previous_close || (old?.change_pct != null ? Number(old.price) / (1 + Number(old.change_pct) / 100) : null);
+    receiveAlertQuote(event.symbol, event);
     quotes[event.symbol] = {...event, previous_close: previous, change_pct: previous > 0 ? (Number(event.price) / Number(previous) - 1) * 100 : null};
     rememberLiveBar(event.symbol, {t: event.timestamp, c: event.price}, 'trade');
     if (event.symbol === selected.symbol) renderQuote();
@@ -484,6 +493,7 @@ function renderStockSelectors() {
     const option = element('option', `${stock.symbol} · ${stock.name}`); option.value = stock.symbol; $('symbol').append(option);
   });
   $('symbol').disabled = !STOCKS.length; $('symbol').value = STOCKS.length ? selected.symbol : '';
+  $('new-price-alert').disabled = !STOCKS.length; $('create-selected-alert').disabled = !STOCKS.length;
 }
 function persistWatchlist(action) {
   const saved = storage.set(WATCHLIST_KEY, JSON.stringify(STOCKS.map(({symbol, name}) => ({symbol, name}))));
@@ -626,6 +636,160 @@ $('confirm-order').addEventListener('click', async () => {
     submitting = false; $('cancel-review').disabled = false; updateEstimate(); await refresh();
   }
 });
+function alertLabel(alert) { return `${alert.symbol} at or ${alert.condition} ${alertMoney(alert.target)}`; }
+function alertQuoteText(quote) {
+  const delayed = quote.delayed || quote.timing_verified === false;
+  return `${alertMoney(quote.price)} · quote ${time(TradePriceAlerts.quoteStamp(quote.timestamp)?.ms ?? quote.timestamp)} · ${quote.source}${delayed ? ' · may be delayed / stale' : ''}`;
+}
+function renderPriceAlerts() {
+  $('price-alert-count').textContent = priceAlerts.alerts.length;
+  const activeSymbols = priceAlerts.activeSymbols(), failed = activeSymbols.filter(symbol => alertQuoteFailures.has(symbol));
+  $('alerts-monitor-status').textContent = !activeSymbols.length ? 'No active price alerts.'
+    : !(marketConnected || connected) || configurationBlocked ? `Waiting for a data connection to monitor ${activeSymbols.length} symbol(s).`
+    : failed.length ? `Quotes unavailable for ${failed.join(', ')}. Monitoring will retry; missing prices never trigger an alert.`
+    : `Monitoring ${activeSymbols.length} symbol${activeSymbols.length === 1 ? '' : 's'} while this dashboard is open. Quotes are checked about every 30 seconds; visible live updates may notify sooner.`;
+  const unreadItems = priceAlerts.notifications.filter(item => !item.read), unread = unreadItems.length;
+  const unreadIds = new Set(unreadItems.map(item => item.id));
+  [...$('alert-toasts').children].forEach(toast => { if (!unreadIds.has(toast.dataset.notificationId)) toast.remove(); });
+  $('notification-count').textContent = unread; $('notification-count').hidden = !unread;
+  $('open-notifications').setAttribute('aria-label', `Notifications (${unread} unread)`);
+  const root = $('price-alerts-list'); root.replaceChildren();
+  if (!priceAlerts.alerts.length) root.append(element('p', 'Choose a stock and target to create your first price alert.', 'empty-state'));
+  priceAlerts.alerts.forEach(alert => {
+    const row = element('div', null, 'price-alert-row'), details = element('div', null, 'price-alert-details');
+    details.append(element('strong', alertLabel(alert)), element('small', alert.lastQuote ? alertQuoteText(alert.lastQuote) : 'Waiting for a first quote to establish a baseline.'));
+    const actions = element('div', null, 'price-alert-actions'); actions.append(statusBadge(alert.status));
+    const toggle = element('button', alert.status === 'active' ? 'Pause' : alert.status === 'paused' ? 'Resume' : 'Re-arm', 'secondary-button');
+    toggle.type = 'button'; toggle.dataset.alertToggle = alert.id;
+    const pauseRequested = alert.status === 'active';
+    toggle.addEventListener('click', async () => {
+      try {
+        await mutatePriceAlerts(book => { const current = book.find(alert.id); if (pauseRequested) book.pause(alert.id); else book.arm(alert.id, quotes[current.symbol] || current.lastQuote); });
+        $('alerts-action-status').textContent = 'Alert updated.'; monitorAlertPrices();
+      } catch (error) { $('alerts-action-status').textContent = error.message; }
+    });
+    const remove = element('button', 'Delete', 'secondary-button'); remove.type = 'button'; remove.dataset.alertDelete = alert.id;
+    remove.addEventListener('click', async () => { await mutatePriceAlerts(book => book.remove(alert.id)); $('alerts-action-status').textContent = 'Alert deleted.'; });
+    actions.append(toggle, remove); row.append(details, actions); root.append(row);
+  });
+  if ($('notifications-dialog').open) renderPriceNotifications();
+}
+function renderPriceNotifications() {
+  const root = $('notification-list'); root.replaceChildren();
+  if (!priceAlerts.notifications.length) root.append(element('p', 'No price alerts have triggered yet.', 'empty-state'));
+  priceAlerts.notifications.forEach(notification => {
+    const row = element('article', null, `price-notification${notification.read ? '' : ' unread'}`);
+    const details = element('div'); details.append(element('strong', alertLabel(notification)), element('p', alertQuoteText(notification.quote)), element('small', `Observed ${time(notification.observedAt)}`));
+    const actions = element('div', null, 'price-notification-actions');
+    if (!notification.read) {
+      const read = element('button', 'Mark read', 'text-button'); read.type = 'button'; read.dataset.notificationRead = notification.id;
+      read.addEventListener('click', () => mutatePriceAlerts(book => book.markRead(notification.id))); actions.append(read);
+    }
+    const remove = element('button', 'Remove', 'text-button'); remove.type = 'button'; remove.dataset.notificationDismiss = notification.id;
+    remove.addEventListener('click', () => mutatePriceAlerts(book => book.dismiss(notification.id))); actions.append(remove);
+    row.append(details, actions); root.append(row);
+  });
+}
+function showPriceToast(notification) {
+  if (!priceAlerts.notifications.some(item => item.id === notification.id && !item.read)) return;
+  const root = $('alert-toasts'), toast = element('article', null, 'price-alert-toast'); toast.setAttribute('role', 'status'); toast.dataset.notificationId = notification.id;
+  toast.append(element('strong', `Price alert: ${alertLabel(notification)}`), element('p', alertQuoteText(notification.quote)));
+  const close = element('button', 'Dismiss', 'text-button'); close.type = 'button'; close.setAttribute('aria-label', `Dismiss ${notification.symbol} price alert`);
+  close.addEventListener('click', () => { toast.remove(); mutatePriceAlerts(book => book.markRead(notification.id)); }); toast.append(close); root.append(toast);
+  while (root.children.length > 3) root.firstElementChild.remove();
+}
+async function mutatePriceAlerts(change, render = true) {
+  const run = () => {
+    const saved = storage.get(PRICE_ALERTS_KEY);
+    if (saved && saved !== alertsSavedRaw) { priceAlerts = new TradePriceAlerts.AlertBook(saved); alertsSavedRaw = saved; }
+    const before = priceAlerts.serialize(), result = change(priceAlerts), after = priceAlerts.serialize();
+    if (before !== after) {
+      const persisted = storage.set(PRICE_ALERTS_KEY, after); alertsStorageFailed = !persisted;
+      if (persisted) alertsSavedRaw = after;
+      else $('alerts-action-status').textContent = 'Browser storage is unavailable. Alerts and notifications will last only for this session.';
+    }
+    if (render || (Array.isArray(result) && result.length)) renderPriceAlerts();
+    return result;
+  };
+  // Serialize read/modify/write across same-origin tabs when Web Locks are available.
+  if (globalThis.navigator?.locks?.request) return globalThis.navigator.locks.request(PRICE_ALERTS_KEY, run);
+  return run();
+}
+function receiveAlertQuote(symbol, quote) {
+  if (TradePriceAlerts.quoteStamp(quote?.timestamp) && Number.isFinite(Number(quote?.price)) && Number(quote.price) > 0) alertQuoteFailures.delete(symbol);
+  if (!priceAlerts.activeSymbols().includes(symbol)) return;
+  mutatePriceAlerts(book => book.accept(symbol, quote), false).then(notifications => notifications.forEach(showPriceToast)).catch(error => { $('alerts-action-status').textContent = error.message; });
+}
+async function monitorAlertPrices() {
+  if (alertsMonitoring || configurationBlocked || !(marketConnected || connected)) return;
+  const active = priceAlerts.activeSymbols();
+  if (!active.length) { $('alerts-monitor-status').textContent = 'No active price alerts.'; return; }
+  const symbols = active;
+  $('alerts-monitor-status').textContent = `Monitoring ${active.length} symbol${active.length === 1 ? '' : 's'} while this dashboard is open. Quotes are checked about every 30 seconds; visible live updates may notify sooner.`;
+  if (!symbols.length) return;
+  alertsMonitoring = true;
+  const origin = apiBase;
+  try {
+    const results = await Promise.allSettled(symbols.map(async symbol => {
+      const quote = await api(`/api/market/${symbol}/quote`, {base: origin});
+      if (origin === apiBase) saveSnapshot(symbol, quote);
+    }));
+    if (origin === apiBase) { results.forEach((result, index) => { if (result.status === 'rejected') alertQuoteFailures.add(symbols[index]); }); renderPriceAlerts(); }
+  } finally { alertsMonitoring = false; }
+}
+async function loadAlertReference() {
+  const epoch = ++alertReferenceEpoch, symbol = $('alert-symbol').value, origin = apiBase;
+  alertReference = null;
+  if (!symbol) return;
+  const existing = quotes[symbol];
+  if (existing) { alertReference = {symbol, quote: existing}; $('alert-reference-price').textContent = `Reference: ${alertMoney(existing.price)} · quote ${time(existing.timestamp)}. A newer quote is required to trigger.`; }
+  else $('alert-reference-price').textContent = 'Loading a reference quote. The first available quote establishes a baseline.';
+  if (!(marketConnected || connected)) return;
+  try {
+    const quote = await api(`/api/market/${symbol}/quote`, {base: origin});
+    if (epoch !== alertReferenceEpoch || origin !== apiBase) return;
+    alertReference = {symbol, quote}; saveSnapshot(symbol, quote);
+    $('alert-reference-price').textContent = `Reference: ${alertMoney(quote.price)} · quote ${time(quote.timestamp)}. A newer quote is required to trigger.`;
+  } catch { if (epoch === alertReferenceEpoch) $('alert-reference-price').textContent = 'A reference quote is unavailable. Monitoring will establish a baseline when data returns.'; }
+}
+function openPriceAlert(symbol = selected.symbol) {
+  if (!STOCKS.length) { $('alerts-action-status').textContent = 'Add a stock to your watchlist before creating an alert.'; return; }
+  $('alert-symbol').replaceChildren(...STOCKS.map(stock => { const option = element('option', `${stock.symbol} · ${stock.name}`); option.value = stock.symbol; return option; }));
+  $('alert-symbol').value = STOCKS.some(stock => stock.symbol === symbol) ? symbol : STOCKS[0].symbol;
+  $('alert-condition').value = 'above'; $('alert-target').value = ''; $('price-alert-error').textContent = '';
+  $('price-alert-dialog').showModal(); loadAlertReference();
+}
+$('new-price-alert').addEventListener('click', () => openPriceAlert());
+$('create-selected-alert').addEventListener('click', () => openPriceAlert());
+$('alert-symbol').addEventListener('change', loadAlertReference);
+$('cancel-price-alert').addEventListener('click', () => { alertReferenceEpoch++; $('price-alert-dialog').close(); });
+function latestAlertBaseline(symbol, book) {
+  const candidates = [quotes[symbol], alertReference?.symbol === symbol ? alertReference.quote : null,
+    ...book.alerts.filter(alert => alert.symbol === symbol).map(alert => alert.lastQuote)];
+  return candidates.filter(quote => TradePriceAlerts.quoteStamp(quote?.timestamp))
+    .sort((a, b) => TradePriceAlerts.quoteStamp(b.timestamp).key.localeCompare(TradePriceAlerts.quoteStamp(a.timestamp).key))[0];
+}
+$('price-alert-form').addEventListener('submit', async event => {
+  event.preventDefault(); $('save-price-alert').disabled = true;
+  try {
+    const symbol = $('alert-symbol').value, stock = STOCKS.find(item => item.symbol === symbol);
+    if (!stock) throw new Error('Select a stock from your watchlist.');
+    const rule = {symbol, name: stock.name, condition: $('alert-condition').value, target: $('alert-target').value};
+    await mutatePriceAlerts(book => book.add(rule, latestAlertBaseline(symbol, book)));
+    $('price-alert-dialog').close(); alertReferenceEpoch++;
+    $('alerts-action-status').textContent = alertsStorageFailed ? 'Alert created for this session only; browser storage is unavailable.' : 'Alert saved. Waiting for a newer quote that meets your target.';
+    monitorAlertPrices();
+  } catch (error) { $('price-alert-error').textContent = error.message; }
+  finally { $('save-price-alert').disabled = false; }
+});
+$('open-notifications').addEventListener('click', () => { renderPriceNotifications(); $('notifications-dialog').showModal(); });
+$('close-notifications').addEventListener('click', () => $('notifications-dialog').close());
+$('mark-notifications-read').addEventListener('click', () => mutatePriceAlerts(book => book.markRead()));
+window.addEventListener('storage', event => {
+  if (event.key === PRICE_ALERTS_KEY || event.key === null) { alertsSavedRaw = event.newValue || ''; priceAlerts = new TradePriceAlerts.AlertBook(alertsSavedRaw); renderPriceAlerts(); }
+});
+renderPriceAlerts();
+setInterval(monitorAlertPrices, 30000);
 function apiOrigin(value) {
   const url = new URL(value);
   if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Enter only the API origin, without credentials, paths, or query parameters.');
@@ -694,6 +858,7 @@ $('connection-form').addEventListener('submit', async event => {
     const checked = await checkConnection(false);
     if (!checked) return;
     stopMarketStream(); streamTerminal = false; liveBars.clear();
+    selectionEpoch++; alertReferenceEpoch++;
     apiBase = checked.origin; apiToken = checked.token; quotes = {}; account = null; connected = false; marketConnected = false;
     lastRefresh = null; currentBars = [];
     ['equity', 'cash', 'invested', 'buying-power', 'realized-pl', 'unrealized-pl', 'fill-count'].forEach(id => { $(id).textContent = '—'; });
@@ -710,7 +875,7 @@ $('refresh-market').addEventListener('click', manualRefresh);
 function updateNavigation() {
   const hash = location.hash || '#overview';
   document.querySelectorAll('.nav-link').forEach(link => { const active = link.hash === hash; link.classList.toggle('active', active); if (active) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); });
-  const active = document.querySelector('.nav-link.active'); document.querySelector('.breadcrumb b').textContent = active ? active.textContent.trim().split(' ').pop() : 'Overview';
+  const active = document.querySelector('.nav-link.active'); document.querySelector('.breadcrumb b').textContent = active ? active.textContent.trim().split(/\s+/).slice(1).join(' ') : 'Overview';
 }
 window.addEventListener('hashchange', updateNavigation);
 const dateFormatter = new Intl.DateTimeFormat(undefined, {weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'});
@@ -730,4 +895,4 @@ setInterval(() => { if (!configurationBlocked && !document.hidden && !$('review-
 
 window.addEventListener('pagehide', stopMarketStream);
 document.addEventListener('visibilitychange', () => { if (document.hidden) stopMarketStream(); else refresh(); });
-setInterval(() => { renderQuote(); renderWatchlist(); }, 5000);
+setInterval(() => { renderQuote(); renderWatchlist(); renderPriceAlerts(); }, 5000);
