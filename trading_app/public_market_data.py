@@ -35,7 +35,7 @@ class PublicMarketData:
                 self.locks[key] = lock
             return lock
 
-    def cached(self, key, ttl=15):
+    def cached(self, key, ttl=5):
         with self.lock:
             cached = self.cache.get(key)
             if cached and self.monotonic() - cached[0] < ttl:

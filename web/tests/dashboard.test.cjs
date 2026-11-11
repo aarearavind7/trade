@@ -21,7 +21,7 @@ async function boot(options = {}) {
   const storage = {getItem: key => saved.get(key) || null, setItem: (key, value) => { if (options.storageFailure) throw new Error('Storage unavailable'); saved.set(key, value); }};
   const calls = [];
   let submitCount = 0;
-  const periodicRefresh = [];
+  const periodicRefresh = [], intervals = [];
   let streamTransport;
   const date = new Date().toISOString();
   const fetch = async (url, init) => {
@@ -84,14 +84,14 @@ async function boot(options = {}) {
     else throw new Error(`Unexpected API ${path}`);
     return new Response(JSON.stringify(data), {headers: {'Content-Type': 'application/json'}});
   };
-  const context = vm.createContext({window, document, Node: window.Node, location: {origin: options.origin || 'http://localhost:8000', href: options.href || 'http://localhost:8000', hash: ''}, localStorage: storage, sessionStorage: storage, URL, AbortController, TextDecoder, navigator: options.navigator, fetch, console, setTimeout, clearTimeout, setInterval: callback => { periodicRefresh.push(callback); return 0; }});
+  const context = vm.createContext({window, document, Node: window.Node, location: {origin: options.origin || 'http://localhost:8000', href: options.href || 'http://localhost:8000', hash: ''}, localStorage: storage, sessionStorage: storage, URL, AbortController, TextDecoder, navigator: options.navigator, fetch, console, setTimeout, clearTimeout, setInterval: (callback, ms) => { periodicRefresh.push(callback); intervals.push({callback, ms}); return 0; }});
   vm.runInContext(chartCode, context);
   vm.runInContext(alertsCode, context);
   vm.runInContext(code, context);
   await flush();
   const click = async selector => { document.querySelector(selector).dispatchEvent(new window.Event('click')); await flush(); };
   const submit = async id => { $(id).dispatchEvent(new window.Event('submit', {cancelable: true})); await flush(); };
-  return {$, click, submit, calls, saved, window, context, options, tick: async () => { periodicRefresh.forEach(callback => callback()); await flush(); },
+  return {$, click, submit, calls, saved, window, context, options, tickInterval: async ms => { intervals.filter(timer => timer.ms === ms).forEach(timer => timer.callback()); await flush(); }, tick: async () => { periodicRefresh.forEach(callback => callback()); await flush(); },
     emit: async (event, split = false) => {
       const bytes = new TextEncoder().encode('data: ' + JSON.stringify(event) + '\n\n');
       if (split) { streamTransport.enqueue(bytes.slice(0, 10)); streamTransport.enqueue(bytes.slice(10)); } else streamTransport.enqueue(bytes);
@@ -233,7 +233,7 @@ test('without paper keys, real public market prices populate charts while accoun
   assert.ok(app.$('chart-line').getAttribute('d').startsWith('M'));
   assert.match(app.$('connection-status').textContent, /Yahoo Finance/);
   assert.match(app.$('chart-data-note').textContent, /may be delayed/);
-  assert.match(app.$('stream-status').textContent, /30-second refresh/);
+  assert.match(app.$('stream-status').textContent, /10-second refresh/);
   assert.equal(app.$('submit-order').disabled, true);
   assert.equal(app.$('cash').textContent, '—');
   assert.ok(app.window.document.body.classList.contains('market-only'));
@@ -595,4 +595,20 @@ test('live broker bars retain their OHLC and volume; trade-only ticks stay visib
     assert.match(app.$('chart-indicator-note').textContent, /provisional/);
     assert.match(app.$('chart-readout').textContent, /OHLC\/volume awaiting broker bar/);
   } finally { await app.close(); }
+});
+
+test('public stock prices and selected chart refresh on the ten-second timer without account polling', async () => {
+  const app = await boot({configured: false, publicData: true});
+  const before = app.calls.length;
+  await app.tickInterval(10000);
+  const requests = app.calls.slice(before);
+  assert.equal(requests.filter(call => call.path.endsWith('/quote')).length, 6);
+  assert.ok(requests.some(call => call.path === '/api/market/AAPL/bars'));
+  assert.ok(!requests.some(call => call.path === '/api/account' || call.path === '/api/performance'));
+  assert.match(app.$('stream-status').textContent, /10-second refresh.*may be delayed/);
+  assert.match(app.$('chart-data-note').textContent, /every 10 seconds/);
+  Object.defineProperty(app.window.document, 'hidden', {configurable: true, value: true});
+  const hidden = app.calls.length;
+  await app.tickInterval(10000);
+  assert.equal(app.calls.length, hidden);
 });

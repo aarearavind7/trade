@@ -46,7 +46,10 @@ def test_public_quotes_bars_schedule_and_cache_have_real_source_labels():
     assert len(opener.calls) == 1
     assert opener.calls[0].full_url.startswith('https://query1.finance.yahoo.com/')
     assert not any('alpaca' in key.lower() for key in opener.calls[0].headers)
-    now[0] = 16
+    now[0] = 4.9
+    provider.quote('AAPL')
+    assert len(opener.calls) == 1
+    now[0] = 5
     provider.quote('AAPL')
     assert len(opener.calls) == 2
 

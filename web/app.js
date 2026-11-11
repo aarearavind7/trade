@@ -12,6 +12,7 @@ const money = value => value == null || !Number.isFinite(Number(value)) ? '—' 
 const quantity = value => new Intl.NumberFormat('en-US', {maximumFractionDigits: 6}).format(Number(value));
 const time = value => value ? new Date(value).toLocaleString() : 'Unavailable';
 const storage = {get(key, session = false) { try { return (session ? sessionStorage : localStorage).getItem(key) || ''; } catch { return ''; } }, set(key, value, session = false) { try { (session ? sessionStorage : localStorage).setItem(key, value); return true; } catch { return false; } }};
+const MARKET_REFRESH_MS = 10000;
 const WATCHLIST_KEY = 'trade-watchlist-v1';
 const MAX_WATCHLIST = 1000;
 const WATCHLIST_PAGE_SIZE = 20;
@@ -195,7 +196,7 @@ function renderStreamStatus(detail) {
   if (detail !== undefined) streamDetail = detail;
   if (publicMarketMode) {
     $('stream-status').className = 'stream-indicator delayed';
-    $('stream-status').textContent = 'Yahoo Finance · 30-second refresh · may be delayed';
+    $('stream-status').textContent = 'Yahoo Finance · 10-second refresh · may be delayed';
     return;
   }
   const quote = quotes[selected.symbol];
@@ -330,7 +331,7 @@ async function loadSelected() {
     currentBars = results[1].value.bars || [];
     if (period === '1D') mergeLiveBars(symbol);
     const delay = results[1].value.delay_minutes || 0;
-    $('chart-data-note').textContent = results[1].value.source === 'Yahoo Finance' ? 'Yahoo Finance · may be delayed · refreshed every 30 seconds' : `${delay ? `Historical bars · ≥${delay} min delay` : period === '1D' ? '1-minute bars · live trade updates' : 'Historical bars · current feed'}${results[1].value.next_page_token ? ' · truncated' : ''}`;
+    $('chart-data-note').textContent = results[1].value.source === 'Yahoo Finance' ? 'Yahoo Finance · may be delayed · refreshed every 10 seconds' : `${delay ? `Historical bars · ≥${delay} min delay` : period === '1D' ? '1-minute bars · live trade updates' : 'Historical bars · current feed'}${results[1].value.next_page_token ? ' · truncated' : ''}`;
   } else { currentBars = []; $('chart-data-note').textContent = results[1].reason.message; }
   renderQuote(); renderChart(); renderWatchlist();
 }
@@ -606,6 +607,18 @@ async function refresh() {
   finally { refreshing = false; $('refresh-data').disabled = false; $('refresh-market').disabled = false; updateEstimate(); }
 }
 
+async function refreshMarketPrices() {
+  if (refreshing || configurationBlocked || document.hidden || !(marketConnected || connected)) return;
+  refreshing = true;
+  $('refresh-data').disabled = true; $('refresh-market').disabled = true;
+  try {
+    await Promise.allSettled([refreshPagePrices(), loadSelected()]);
+  } finally {
+    refreshing = false;
+    $('refresh-data').disabled = false; $('refresh-market').disabled = false;
+  }
+}
+
 function renderStockSelectors() {
   renderPageControls();
   $('stock-tabs').replaceChildren(); $('symbol').replaceChildren();
@@ -772,7 +785,7 @@ function renderPriceAlerts() {
   $('alerts-monitor-status').textContent = !activeSymbols.length ? 'No active price alerts.'
     : !(marketConnected || connected) || configurationBlocked ? `Waiting for a data connection to monitor ${activeSymbols.length} symbol(s).`
     : failed.length ? `Quotes unavailable for ${failed.join(', ')}. Monitoring will retry; missing prices never trigger an alert.`
-    : `Monitoring ${activeSymbols.length} symbol${activeSymbols.length === 1 ? '' : 's'} while this dashboard is open. Quotes are checked about every 30 seconds; visible live updates may notify sooner.`;
+    : `Monitoring ${activeSymbols.length} symbol${activeSymbols.length === 1 ? '' : 's'} while this dashboard is open. Quotes are checked about every 10 seconds; visible live updates may notify sooner.`;
   const unreadItems = priceAlerts.notifications.filter(item => !item.read), unread = unreadItems.length;
   const unreadIds = new Set(unreadItems.map(item => item.id));
   [...$('alert-toasts').children].forEach(toast => { if (!unreadIds.has(toast.dataset.notificationId)) toast.remove(); });
@@ -850,7 +863,7 @@ async function monitorAlertPrices() {
   const active = priceAlerts.activeSymbols();
   if (!active.length) { $('alerts-monitor-status').textContent = 'No active price alerts.'; return; }
   const symbols = active;
-  $('alerts-monitor-status').textContent = `Monitoring ${active.length} symbol${active.length === 1 ? '' : 's'} while this dashboard is open. Quotes are checked about every 30 seconds; visible live updates may notify sooner.`;
+  $('alerts-monitor-status').textContent = `Monitoring ${active.length} symbol${active.length === 1 ? '' : 's'} while this dashboard is open. Quotes are checked about every 10 seconds; visible live updates may notify sooner.`;
   if (!symbols.length) return;
   alertsMonitoring = true;
   const origin = apiBase;
@@ -914,7 +927,7 @@ window.addEventListener('storage', event => {
   if (event.key === PRICE_ALERTS_KEY || event.key === null) { alertsSavedRaw = event.newValue || ''; priceAlerts = new TradePriceAlerts.AlertBook(alertsSavedRaw); renderPriceAlerts(); }
 });
 renderPriceAlerts();
-setInterval(monitorAlertPrices, 30000);
+setInterval(monitorAlertPrices, MARKET_REFRESH_MS);
 function apiOrigin(value) {
   const url = new URL(value);
   if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Enter only the API origin, without credentials, paths, or query parameters.');
@@ -1016,6 +1029,7 @@ function updateLocalClock() {
 updateLocalClock();
 setInterval(updateLocalClock, 1000);
 selectStock(selected.symbol); renderWatchlist(); updateNavigation(); refresh();
+setInterval(refreshMarketPrices, MARKET_REFRESH_MS);
 setInterval(() => { if (!configurationBlocked && !document.hidden && !$('review-dialog').open && !$('connection-dialog').open) refresh(); }, 30000);
 
 window.addEventListener('pagehide', stopMarketStream);
