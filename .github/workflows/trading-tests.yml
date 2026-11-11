@@ -26,6 +26,8 @@ jobs:
       - run: node --check web/app.js
       - run: node --check web/price-alerts.js
       - run: node --check web/chart-data.js
+      - run: node --check web/workspace-backup.js
+      - run: node --check web/research.js
       - run: npm ci --prefix web
       - run: npm test --prefix web
 

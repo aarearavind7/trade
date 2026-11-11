@@ -50,8 +50,8 @@ class PublicMarketData:
             while len(self.cache) > 128:
                 self.cache.popitem(last=False)
 
-    def chart(self, symbol, period='1D'):
-        symbol = AlpacaClient.symbol(symbol)
+    def chart(self, symbol, period='1D', *, benchmark=False):
+        symbol = '^GSPC' if benchmark else AlpacaClient.symbol(symbol)
         key = symbol, period
         with self.key_lock(key):
             cached = self.cached(key)
@@ -173,6 +173,15 @@ class PublicMarketData:
             raise PublicDataError('The public source returned invalid chart data.') from exc
         return {'bars': bars, 'feed': 'public', 'source': self.source, 'delayed': True,
                 'timing_verified': False, 'delay_minutes': None, 'next_page_token': None}
+
+    def benchmark_history(self):
+        data = self.chart('^GSPC', '1M', benchmark=True)
+        if data.get('meta', {}).get('symbol') != '^GSPC':
+            raise PublicDataError('The public source did not return the S&P 500 index.')
+        try:
+            return [{'timestamp': stamp, 'close': close} for stamp, close in zip(data.get('timestamp') or [], data['indicators']['quote'][0]['close']) if close is not None]
+        except (KeyError, TypeError, IndexError) as exc:
+            raise PublicDataError('S&P 500 history is unavailable.') from exc
 
     def clock(self):
         meta = self.chart('AAPL')['meta']

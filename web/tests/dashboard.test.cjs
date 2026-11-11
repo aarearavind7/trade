@@ -5,6 +5,8 @@ const vm = require('node:vm');
 const {parseHTML} = require('linkedom');
 const html = fs.readFileSync(`${__dirname}/../index.html`, 'utf8');
 const code = fs.readFileSync(`${__dirname}/../app.js`, 'utf8');
+const researchCode = fs.readFileSync(`${__dirname}/../research.js`, 'utf8');
+const backupCode = fs.readFileSync(`${__dirname}/../workspace-backup.js`, 'utf8');
 const chartCode = fs.readFileSync(`${__dirname}/../chart-data.js`, 'utf8');
 const alertsCode = fs.readFileSync(`${__dirname}/../price-alerts.js`, 'utf8');
 const REVIEW_ID = 'e4de82d3-9e39-4c15-a435-de206852b186';
@@ -13,13 +15,16 @@ const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(resol
 async function boot(options = {}) {
   const {window, document} = parseHTML(html);
   const $ = id => document.getElementById(id);
-  for (const [id, value] of [['symbol', 'AAPL'], ['order-type', 'market'], ['watchlist-page-select', '0'], ['alert-symbol', 'AAPL'], ['alert-condition', 'above']]) Object.defineProperty($(id), 'value', {writable: true, value});
+  for (const [id, value] of [['symbol', 'AAPL'], ['order-type', 'market'], ['watchlist-page-select', '0'], ['alert-symbol', 'AAPL'], ['alert-condition', 'above'], ['journal-state', 'planned'], ['import-workspace-mode', 'merge']]) Object.defineProperty($(id), 'value', {writable: true, value});
   for (const id of ['chart-volume', 'chart-ma20', 'chart-ma50']) $(id).checked = true;
   window.HTMLElement.prototype.showModal = function () { this.open = true; };
   window.HTMLElement.prototype.close = function () { this.open = false; };
   const saved = options.saved || new Map();
   const storage = {getItem: key => saved.get(key) || null, setItem: (key, value) => { if (options.storageFailure) throw new Error('Storage unavailable'); saved.set(key, value); }};
   const calls = [];
+  const journalEntries = [];
+  window.HTMLElement.prototype.focus = function () {};
+
   let submitCount = 0;
   const periodicRefresh = [], intervals = [];
   let streamTransport;
@@ -42,6 +47,19 @@ async function boot(options = {}) {
       if (options.searchHandler) return options.searchHandler(url, init);
       if (options.searchFailure) return new Response(JSON.stringify({detail: 'Stock search is temporarily unavailable'}), {status: 502, headers: {'Content-Type': 'application/json'}});
       data = {source: 'Yahoo Finance', results: options.searchResults || [{symbol: 'AMZN', name: 'Amazon.com, Inc.', exchange: 'NASDAQ'}, {symbol: 'JPM', name: 'JPMorgan Chase', exchange: 'NYSE'}]};
+    }
+    else if (path.startsWith('/api/research/')) {
+      if (options.researchFailure) return new Response(JSON.stringify({detail: 'Add FMP_API_KEY to the server .env'}), {status: 503, headers: {'Content-Type': 'application/json'}});
+      data = {symbol: path.split('/')[3], name: 'Company', revenue: 1000000, net_income: 200000, total_debt: 50000, pe_ttm: 20, sector: 'Technology', market_cap: 5000000, currency: 'USD', income_date: '2025-12-31', debt_date: '2025-12-31', next_earnings_date: '2027-01-20', source: 'Financial Modeling Prep', retrieved_at: date, unavailable_sections: []};
+    }
+    else if (path === '/api/benchmark') data = {points: [{date: '2026-11-09', portfolio_pct: 0, benchmark_pct: 0}, {date: '2026-11-10', portfolio_pct: 2, benchmark_pct: 1}], portfolio_return_pct: 2, benchmark_return_pct: 1, start: '2026-11-09', end: '2026-11-10', source: 'Yahoo Finance', matched_sessions: 2, note: 'Equity includes deposits; index excludes dividends.'};
+    else if (path === '/api/screener') data = {results: [{symbol: 'AMZN', name: 'Amazon', sector: 'Technology', price: 200, volume: 1000, market_cap: 2000000, change_pct: 2, timestamp: 1794411000}], candidate_count: 100, source: 'Financial Modeling Prep', retrieved_at: date, note: 'Bounded candidates; quotes may be delayed.'};
+    else if (path.startsWith('/api/journal')) {
+      const id = path.split('/')[3];
+      if (init.method === 'POST') { data = {...JSON.parse(init.body), id: REVIEW_ID, revision: 1, created_at: date, updated_at: date}; journalEntries.push(data); }
+      else if (init.method === 'PUT') { data = {...JSON.parse(init.body), id, revision: 2, updated_at: date}; journalEntries.splice(0, 1, data); }
+      else if (init.method === 'DELETE') { journalEntries.splice(0, 1); data = {deleted: true}; }
+      else data = {entries: journalEntries, total: journalEntries.length, offset: 0, limit: 50};
     }
     else if (path === '/api/connection') {
       if (options.connectionUnauthorized) return new Response(JSON.stringify({detail: 'Enter the application access token'}), {status: 401, headers: {'Content-Type': 'application/json'}});
@@ -84,10 +102,12 @@ async function boot(options = {}) {
     else throw new Error(`Unexpected API ${path}`);
     return new Response(JSON.stringify(data), {headers: {'Content-Type': 'application/json'}});
   };
-  const context = vm.createContext({window, document, Node: window.Node, location: {origin: options.origin || 'http://localhost:8000', href: options.href || 'http://localhost:8000', hash: ''}, localStorage: storage, sessionStorage: storage, URL, AbortController, TextDecoder, navigator: options.navigator, fetch, console, setTimeout, clearTimeout, setInterval: (callback, ms) => { periodicRefresh.push(callback); intervals.push({callback, ms}); return 0; }});
+  const context = vm.createContext({window, document, Node: window.Node, location: {origin: options.origin || 'http://localhost:8000', href: options.href || 'http://localhost:8000', hash: ''}, localStorage: storage, sessionStorage: storage, URL, URLSearchParams, Blob, AbortController, TextDecoder, navigator: options.navigator, fetch, console, setTimeout, clearTimeout, setInterval: (callback, ms) => { periodicRefresh.push(callback); intervals.push({callback, ms}); return 0; }});
   vm.runInContext(chartCode, context);
   vm.runInContext(alertsCode, context);
+  vm.runInContext(backupCode, context);
   vm.runInContext(code, context);
+  if (options.research) vm.runInContext(researchCode, context);
   await flush();
   const click = async selector => { document.querySelector(selector).dispatchEvent(new window.Event('click')); await flush(); };
   const submit = async id => { $(id).dispatchEvent(new window.Event('submit', {cancelable: true})); await flush(); };
@@ -611,4 +631,58 @@ test('public stock prices and selected chart refresh on the ten-second timer wit
   const hidden = app.calls.length;
   await app.tickInterval(10000);
   assert.equal(app.calls.length, hidden);
+});
+
+test('research panels show fiscal dates, compare matched returns, and add screened stocks', async () => {
+  const app = await boot({research: true});
+  assert.match(app.$('fundamentals-content').textContent, /Revenue.*2025-12-31.*Net income.*P\/E.*Total debt.*2027-01-20/);
+  await app.click('#load-benchmark');
+  assert.match(app.$('benchmark-summary').textContent, /\+2.00%.*\+1.00%/);
+  assert.ok(app.$('benchmark-portfolio').getAttribute('d').startsWith('M'));
+  assert.match(app.$('benchmark-status').textContent, /deposits/);
+  await app.submit('screener-form');
+  assert.match(app.$('screener-results').textContent, /AMZN.*Amazon.*Technology/);
+  await app.click('[aria-label="Watch AMZN"]');
+  assert.match(app.$('watchlist-body').textContent, /AMZN/);
+});
+
+test('journal creates, edits and deletes notes through the server without submitting orders', async () => {
+  const app = await boot({research: true, configured: false, publicData: true});
+  app.$('journal-thesis').value = 'Growing revenue'; app.$('journal-expected').value = 'Review after earnings';
+  await app.submit('journal-form');
+  assert.match(app.$('journal-list').textContent, /Growing revenue.*Review after earnings/);
+  await app.click('#journal-list button');
+  app.$('journal-lessons').value = 'Wait for confirmation';
+  await app.submit('journal-form');
+  assert.match(app.$('journal-list').textContent, /Wait for confirmation/);
+  await app.click('#journal-list button:nth-child(2)');
+  assert.match(app.$('journal-list').textContent, /No journal entries/);
+  assert.equal(app.submitCount, 0);
+});
+
+test('research setup failures remain explicit and data status records and clears request failures', async () => {
+  const options = {research: true, researchFailure: true};
+  const app = await boot(options);
+  assert.match(app.$('fundamentals-status').textContent, /FMP_API_KEY/);
+  await app.tickInterval(2000);
+  assert.match(app.$('data-status-errors').textContent, /FMP_API_KEY/);
+  options.researchFailure = false;
+  await app.click('#refresh-fundamentals'); await app.tickInterval(2000);
+  assert.match(app.$('data-status-errors').textContent, /previously failed.*succeeded/);
+  assert.match(app.$('data-status-content').textContent, /IEX exchange only/);
+});
+
+test('backup preview and import restore selections without importing credentials or submitting orders', async () => {
+  const app = await boot({research: true});
+  const raw = {type: 'trade-workspace', version: 1, watchlist: [{symbol: 'AMZN', name: 'Amazon'}], price_alerts: {version: 1, alerts: [], notifications: []}, apiToken: 'DO-NOT-IMPORT'};
+  const file = {size: 1000, text: async () => JSON.stringify(raw)};
+  Object.defineProperty(app.$('import-workspace-file'), 'files', {value: [file]});
+  app.$('import-workspace-mode').value = 'replace';
+  await app.click('#preview-workspace');
+  assert.match(app.$('workspace-backup-status').textContent, /Replace preview: 1 saved stocks/);
+  await app.click('#apply-workspace');
+  assert.match(app.$('workspace-backup-status').textContent, /Import saved: 1 stocks/);
+  assert.deepEqual(JSON.parse(app.saved.get('trade-watchlist-v1')), [{symbol: 'AMZN', name: 'Amazon'}]);
+  assert.ok(![...app.saved.values()].join('').includes('DO-NOT-IMPORT'));
+  assert.equal(app.submitCount, 0);
 });

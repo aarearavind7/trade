@@ -234,6 +234,42 @@ Tests use mocked broker responses and browser DOM/network adapters; they never c
 
 `.github/workflows/trading-tests.yml` runs the Python suite on 3.11, 3.12, and 3.13 with an 80% coverage floor, checks JavaScript syntax, and runs dashboard tests. Existing repository-validation workflows remain in place. DOM tests do not replace full visual browser testing or an integration check with your own paper account.
 
+## Company fundamentals and stock screener
+
+The **Research** panel follows the selected watchlist symbol. It shows annual revenue/net income, trailing P/E, annual balance-sheet debt, market cap, sector, and the next provider-listed earnings date within 90 days. Financial-statement dates and reporting currency are shown; unavailable values stay blank rather than becoming zero. Earnings dates are provisional and can change. Use **Load financials** to retry. Financial responses are cached for up to one hour.
+
+These features use **Financial Modeling Prep (FMP)** independently of the Alpaca price feed. Add your key privately to the project-root `.env`, then restart the server:
+
+```env
+FMP_API_KEY=your_actual_private_fmp_key
+```
+
+Your FMP subscription must allow the stable `profile`, `income-statement`, `balance-sheet-statement`, `ratios-ttm`, and `earnings-calendar` endpoints. No key is included in browser responses or backups. Missing keys, denied endpoints, and provider outages produce setup/error messages; partially available financials remain usable and identify missing sections. The server needs HTTPS access to `financialmodelingprep.com`. No subscription is purchased or enabled by this code.
+
+The **Screener** supports minimum/maximum price, minimum share volume, sector, market-cap bounds (USD), and daily percentage-change bounds. It queries up to **100 US active provider candidates** using `company-screener`, then obtains `batch-quote` data and applies all filters again. Both endpoints require FMP access. Daily-change filtering applies to this candidate subset; it is not an exhaustive market scan. Empty results mean no matches among those candidates, not necessarily no matches anywhere. Results show quote time when supplied, provider, retrieval time, and delayed-data caveats. Screener results are cached for up to 60 seconds and refresh only when you run the screen. **Watch** adds a result to the existing watchlist without submitting an order.
+
+## Portfolio benchmark comparison
+
+Click **Compare last month** to load Alpaca's existing one-month equity history and the Yahoo Finance **S&P 500 price index (`^GSPC`)**. Both series are intersected by New York market-session date and normalized to the same first matching date. At least two valid common dates are required. Missing sessions are excluded, never filled with zero. The chart, summary, and expandable session table use the same matched dates.
+
+This compares **portfolio equity change**, which includes account transfers and income, with the **index price return**, which excludes dividends. It is not a cash-flow-adjusted/time-weighted return or a total-return index. The latest market session can be incomplete, and public index data may lag. A paper account is required for the portfolio side. The benchmark is loaded on demand, so it does not add traffic to the ten-second price refresh.
+
+## Server trade journal
+
+The **Journal** works even in public-price mode. Record a symbol, local trade date, planned/open/closed status, entry rationale, expected outcome, and later lessons. Entries are stored in the `journal` table of `TRADING_DB_PATH`, alongside existing trading state; they survive browser/port changes and server restarts. They are workspace notes, not a record of broker executions, and do not submit orders.
+
+Use **Edit** to update an entry and **Delete entry** to remove it. Each edit/delete supplies its displayed revision; conflicting changes from another tab return a reload message instead of overwriting a newer entry. Browse 50 entries per page, most recently updated first. The journal supports 5,000 entries, with up to 4,000 characters per note field. Back up the server SQLite database while the app is stopped to preserve journal notes along with other server state. Browser workspace backups below do not include server journal notes.
+
+## Data status and portable workspace backups
+
+**Data connection status** shows the selected stock's provider, exchange coverage, feed, quote timestamp, delayed/unverified state, last dashboard quote receipt, last successful API response, and outstanding request failures. Receipt time and quote time are different: a successful ten-second refresh can still receive an older provider quote. API errors remain visible until the same endpoint succeeds; only the latest 20 outstanding endpoint failures are retained. These diagnostics last for this page session. **Check connection** opens the existing server/market/account diagnostics.
+
+Under **Backups**, download a versioned JSON file containing your watchlist, alert rules and notification history. It deliberately excludes Alpaca/FMP credentials, application tokens, API URL, pending orders, and journal notes. Store the file privately because stock selections and alert targets can be personal.
+
+Choose the JSON file, select **Merge** or **Replace**, and click **Preview import**. The preview shows resulting stock and alert counts; **Apply reviewed import** saves it to this browser origin. Merge deduplicates symbols and alert rules; replace replaces the watchlist and alert state. Limits remain 1,000 stocks, 50 alerts, 20 distinct active symbols, and 100 notifications. Invalid/oversized files and over-capacity imports are rejected before applying. Imported active alerts start with a fresh quote baseline, so importing does not fire an old quote. Previously triggered alerts stay triggered until re-armed. Browser storage must be available to apply an import. No order is submitted by export/import.
+
+New authenticated routes: `GET /api/research/{symbol}/fundamentals`, `GET /api/screener`, `GET /api/benchmark`, `GET/POST /api/journal`, and `PUT/DELETE /api/journal/{id}`. Journal updates/deletes use revision checks. Research, journal and backup tests run in the existing CI suite with mocked providers; Chromium smoke checks cover the new panels, journal persistence, screener filtering and backup transfer at desktop/mobile widths. Your own provider subscription/credentials still need a live integration check.
+
 ## Original CLI
 
 The low-level CLI remains available:

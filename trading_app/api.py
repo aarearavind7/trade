@@ -24,6 +24,9 @@ from .market_stream import MarketStream, stream_events, watch_symbols
 from .public_market_data import PublicMarketData, PublicDataError
 from .stock_search import StockSearch, query_text
 from .sp500_catalog import SP500Catalog
+from .research import ResearchData
+from .journal import JournalDraft, JournalUpdate, JournalStore
+from .benchmark import comparison
 from .csv_export import performance_csv, trades_csv
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,7 +37,7 @@ class SubmitRequest(BaseModel):
     review_id: UUID
 
 
-def create_app(broker=None, db_path=None, limits=None, access_token=None, allowed_origins=None, public_client=None, sp500_catalog=None):
+def create_app(broker=None, db_path=None, limits=None, access_token=None, allowed_origins=None, public_client=None, sp500_catalog=None, research_client=None):
     load_dotenv(ROOT / '.env')
     token = access_token if access_token is not None else os.getenv('API_ACCESS_TOKEN', '')
     origins = allowed_origins if allowed_origins is not None else [s.strip() for s in os.getenv('ALLOWED_ORIGINS', '').split(',') if s.strip()]
@@ -48,19 +51,21 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         if application.state.market_stream is not None:
             await application.state.market_stream.close()
 
-    application = FastAPI(title='Trade Paper API', version='1.5.0', lifespan=lifespan, description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
+    application = FastAPI(title='Trade Paper API', version='1.6.0', lifespan=lifespan, description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
     application.state.market_stream = None
     application.state.broker = broker
     application.state.public_market_data = public_client or PublicMarketData()
     application.state.stock_search = StockSearch(application.state.public_market_data)
     application.state.sp500_catalog = sp500_catalog or SP500Catalog()
     public_enabled = os.getenv('PUBLIC_MARKET_DATA', 'true').strip().lower() in {'true', '1', 'yes'}
+    application.state.research = research_client or ResearchData()
+    application.state.journal = JournalStore(store)
     application.state.store = store
     application.state.limits = limits
     hosts = [s.strip() for s in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,[::1],testserver').split(',')]
     application.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
     if origins:
-        application.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=['GET', 'POST', 'DELETE'],
+        application.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=['GET', 'POST', 'PUT', 'DELETE'],
                                    allow_headers=['Authorization', 'Content-Type'], allow_credentials=False)
 
     @application.middleware('http')
@@ -133,7 +138,7 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         configured_broker, setup_message = broker_configuration()
         return {'status': 'ok', 'service': 'trade-paper-api', 'mode': 'paper', 'authentication_required': bool(token),
                 'broker_configured': configured_broker is not None, 'setup_message': setup_message,
-                'market_stream': configured_broker is not None,
+                'market_stream': configured_broker is not None, 'research_configured': application.state.research.configured,
                 'public_market_data': public_enabled and configured_broker is None}
 
     @application.get('/api/connection')
@@ -293,6 +298,47 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
     @application.get('/api/exports/performance.csv')
     def export_performance(svc=Depends(service)):
         return performance_csv(performance(svc))
+
+    @application.get('/api/research/{symbol}/fundamentals')
+    def fundamentals(symbol: str, _=Depends(authorize)):
+        try:
+            symbol = AlpacaClient.symbol(symbol)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return application.state.research.fundamentals(symbol)
+
+    @application.get('/api/screener')
+    def screener(min_price: float | None = Query(None, ge=0, le=10000000), max_price: float | None = Query(None, ge=0, le=10000000),
+                 min_volume: float | None = Query(None, ge=0, le=1e15), min_cap: float | None = Query(None, ge=0, le=1e16),
+                 max_cap: float | None = Query(None, ge=0, le=1e16), sector: str | None = Query(None, max_length=100),
+                 min_change: float | None = Query(None, ge=-100, le=100000), max_change: float | None = Query(None, ge=-100, le=100000), _=Depends(authorize)):
+        filters = dict(min_price=min_price, max_price=max_price, min_volume=min_volume, min_cap=min_cap, max_cap=max_cap,
+                       sector=sector, min_change=min_change, max_change=max_change)
+        for low, high in [('min_price', 'max_price'), ('min_cap', 'max_cap'), ('min_change', 'max_change')]:
+            if filters[low] is not None and filters[high] is not None and filters[low] > filters[high]:
+                raise HTTPException(422, 'Minimum values must not exceed maximum values.')
+        return application.state.research.screen(filters)
+
+    @application.get('/api/benchmark')
+    def benchmark(svc=Depends(service)):
+        return comparison(svc.broker.portfolio_history(), application.state.public_market_data.benchmark_history())
+
+    @application.get('/api/journal')
+    def journal(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=5000), _=Depends(authorize)):
+        return application.state.journal.list(limit, offset)
+
+    @application.post('/api/journal', status_code=201)
+    def create_journal(draft: JournalDraft, _=Depends(authorize)):
+        return application.state.journal.save(draft)
+
+    @application.put('/api/journal/{entry_id}')
+    def update_journal(entry_id: UUID, draft: JournalUpdate, _=Depends(authorize)):
+        return application.state.journal.save(draft, str(entry_id))
+
+    @application.delete('/api/journal/{entry_id}')
+    def delete_journal(entry_id: UUID, revision: int = Query(..., ge=1), _=Depends(authorize)):
+        application.state.journal.delete(str(entry_id), revision)
+        return {'deleted': True}
 
     application.mount('/', StaticFiles(directory=ROOT / 'web', html=True), name='dashboard')
     return application

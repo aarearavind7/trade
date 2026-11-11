@@ -153,3 +153,15 @@ def test_public_chart_preserves_provider_ohlc_and_volume_without_making_up_missi
     assert bars[0]['o'] == 99 and bars[0]['h'] == 101 and bars[0]['l'] == 98
     assert bars[0]['v'] == 12345
     assert 'o' not in bars[1] and 'v' not in bars[1]
+
+
+def test_sp500_benchmark_uses_fixed_index_symbol_without_expanding_public_symbol_validation():
+    data = payload(); data['chart']['result'][0]['meta']['symbol'] = '^GSPC'
+    opener = Opener(json.dumps(data).encode())
+    provider = PublicMarketData(opener)
+    points = provider.benchmark_history()
+    assert len(points) == 2
+    assert '/%5EGSPC?' in opener.calls[0].full_url
+    assert 'range=1mo' in opener.calls[0].full_url
+    with pytest.raises(ValueError):
+        provider.chart('^GSPC')

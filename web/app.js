@@ -86,6 +86,7 @@ let connectionChecking = false, lastConnectionCheck = null;
 let streamSupported = false, streamController = null, streamRetryTimer = null, streamTerminal = false;
 let streamGeneration = 0, streamState = 'waiting', streamRetry = 1000, streamDetail = '';
 const liveBars = new Map();
+const apiStatus = {lastSuccess: null, lastQuoteReceived: null, lastFailure: null, failures: new Map()};
 let account = null, clock = null, quotes = {}, currentBars = [], lastRefresh = null;
 let pendingReview = storage.get(`trade-pending:${apiBase}`);
 const PRICE_ALERTS_KEY = 'trade-price-alerts-v1';
@@ -129,8 +130,14 @@ async function api(path, {method = 'GET', body, base = apiBase, accessToken = ap
       const detail = Array.isArray(data.detail) ? data.detail.map(error => error.msg).join('; ') : data.detail;
       const error = new Error(detail || `API error (${response.status})`); error.status = response.status; throw error;
     }
+    if (base === apiBase) { apiStatus.lastSuccess = new Date().toISOString(); apiStatus.failures.delete(path); }
     return data;
   } catch (error) {
+    if (base === apiBase) {
+      apiStatus.lastFailure = {at: new Date().toISOString(), message: error.message};
+      apiStatus.failures.set(path, apiStatus.lastFailure);
+      if (apiStatus.failures.size > 20) apiStatus.failures.delete(apiStatus.failures.keys().next().value);
+    }
     if (error.name === 'AbortError') throw new Error('API request timed out. If an order was submitted, reconcile its status before retrying.');
     throw error;
   } finally { clearTimeout(timer); }
@@ -343,6 +350,7 @@ function selectStock(symbol) {
     watchlistPage = nextPage; renderStockSelectors(); renderWatchlist(); restartWatchlistStream(); refreshPagePrices();
   }
   $('symbol').value = selected.symbol;
+  window.dispatchEvent(new window.Event('trade-stock-changed'));
   document.querySelectorAll('[data-stock]').forEach(button => { const active = button.dataset.stock === symbol; button.classList.toggle('selected', active); button.setAttribute('aria-pressed', String(active)); });
   currentBars = []; clearChartCursor(); renderQuote(); renderChart();
   if (marketConnected || connected) loadSelected();
@@ -430,6 +438,7 @@ async function reconcileOrder(id, button) {
   finally { if (button) button.disabled = false; }
 }
 function saveSnapshot(symbol, snapshot) {
+  apiStatus.lastQuoteReceived = new Date().toISOString();
   receiveAlertQuote(symbol, snapshot);
   if (!STOCKS.some(stock => stock.symbol === symbol)) return;
   const existing = quotes[symbol];
@@ -478,6 +487,7 @@ function handleMarketEvent(event) {
     if (!Number.isFinite(Number(event.price)) || Number(event.price) <= 0 || !Number.isFinite(new Date(event.timestamp).getTime())) return;
     if (old && new Date(event.timestamp) < new Date(old.timestamp)) return;
     const previous = old?.previous_close || (old?.change_pct != null ? Number(old.price) / (1 + Number(old.change_pct) / 100) : null);
+    apiStatus.lastQuoteReceived = new Date().toISOString();
     receiveAlertQuote(event.symbol, event);
     quotes[event.symbol] = {...event, previous_close: previous, change_pct: previous > 0 ? (Number(event.price) / Number(previous) - 1) * 100 : null};
     rememberLiveBar(event.symbol, {t: event.timestamp, c: event.price}, 'trade');
@@ -1003,6 +1013,8 @@ $('connection-form').addEventListener('submit', async event => {
     ['holdings-content', 'activity-content', 'trades-content'].forEach(id => { $(id).replaceChildren(element('p', 'Connecting to the selected account…', 'empty-state')); });
     $('equity-line').setAttribute('d', ''); renderChart();
     storage.set('trade-api-base', apiBase); storage.set('trade-api-token', apiToken, true);
+    apiStatus.lastSuccess = null; apiStatus.lastQuoteReceived = null; apiStatus.lastFailure = null; apiStatus.failures.clear();
+    window.dispatchEvent(new window.Event('trade-connection-changed'));
     pendingReview = storage.get(`trade-pending:${apiBase}`);
     $('connection-dialog').close(); renderWatchlist(); renderQuote(); await refresh();
   } catch (error) { $('connection-error').textContent = error.message; }
