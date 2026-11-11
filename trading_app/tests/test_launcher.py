@@ -90,7 +90,7 @@ def test_existing_trade_server_opens_without_installing_or_spawning(project, mon
     browser = Mock(return_value=True)
     monkeypatch.setattr(launcher.webbrowser, 'open', browser)
     assert launcher.main(['--port', '8001'], root=project) == 0
-    browser.assert_called_once_with('http://127.0.0.1:8001')
+    browser.assert_called_once_with('http://127.0.0.1:8001/?local=1')
 
 
 def test_unrelated_port_conflict_is_not_killed(project, monkeypatch, capsys):
@@ -98,7 +98,7 @@ def test_unrelated_port_conflict_is_not_killed(project, monkeypatch, capsys):
     monkeypatch.setattr(launcher, 'trade_is_ready', lambda url: False)
     process = Mock(side_effect=AssertionError('must not spawn'))
     monkeypatch.setattr(launcher.subprocess, 'Popen', process)
-    assert launcher.main([], root=project) == 1
+    assert launcher.main(['--port', '8000'], root=project) == 1
     assert '--port 8001' in capsys.readouterr().err
 
 
@@ -170,3 +170,25 @@ def test_browser_failure_keeps_manual_url_available(monkeypatch, capsys):
     monkeypatch.setattr(launcher.webbrowser, 'open', Mock(side_effect=launcher.webbrowser.Error('no browser')))
     launcher.open_dashboard('http://127.0.0.1:8000', True)
     assert 'http://127.0.0.1:8000' in capsys.readouterr().out
+
+
+def test_default_launch_skips_unrelated_ports_and_opens_the_actual_ready_address(project, monkeypatch):
+    monkeypatch.setattr(launcher, 'port_is_open', lambda port: port in {8000, 8001})
+    monkeypatch.setattr(launcher, 'trade_is_ready', lambda url: False)
+    monkeypatch.setattr(launcher, 'prepare_environment', lambda root: launcher.virtual_python(root))
+    process = SimpleNamespace(wait=lambda: 0, poll=lambda: 0)
+    command = []
+    monkeypatch.setattr(launcher.subprocess, 'Popen', lambda args, **kwargs: command.extend(args) or process)
+    monkeypatch.setattr(launcher, 'wait_until_ready', lambda proc, url: None)
+    browser = Mock(return_value=True)
+    monkeypatch.setattr(launcher.webbrowser, 'open', browser)
+    assert launcher.main([], root=project) == 0
+    assert command[command.index('--port') + 1] == '8002'
+    browser.assert_called_once_with('http://127.0.0.1:8002/?local=1')
+
+
+def test_busy_default_port_range_has_actionable_error(project, monkeypatch, capsys):
+    monkeypatch.setattr(launcher, 'port_is_open', lambda port: True)
+    monkeypatch.setattr(launcher, 'trade_is_ready', lambda url: False)
+    assert launcher.main([], root=project) == 1
+    assert '--port 8020' in capsys.readouterr().err

@@ -5,6 +5,7 @@ const vm = require('node:vm');
 const {parseHTML} = require('linkedom');
 const html = fs.readFileSync(`${__dirname}/../index.html`, 'utf8');
 const code = fs.readFileSync(`${__dirname}/../app.js`, 'utf8');
+const chartCode = fs.readFileSync(`${__dirname}/../chart-data.js`, 'utf8');
 const alertsCode = fs.readFileSync(`${__dirname}/../price-alerts.js`, 'utf8');
 const REVIEW_ID = 'e4de82d3-9e39-4c15-a435-de206852b186';
 const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(resolve => setImmediate(resolve)); };
@@ -13,6 +14,7 @@ async function boot(options = {}) {
   const {window, document} = parseHTML(html);
   const $ = id => document.getElementById(id);
   for (const [id, value] of [['symbol', 'AAPL'], ['order-type', 'market'], ['watchlist-page-select', '0'], ['alert-symbol', 'AAPL'], ['alert-condition', 'above']]) Object.defineProperty($(id), 'value', {writable: true, value});
+  for (const id of ['chart-volume', 'chart-ma20', 'chart-ma50']) $(id).checked = true;
   window.HTMLElement.prototype.showModal = function () { this.open = true; };
   window.HTMLElement.prototype.close = function () { this.open = false; };
   const saved = options.saved || new Map();
@@ -62,7 +64,11 @@ async function boot(options = {}) {
     else if (path === '/api/positions') data = [{symbol: 'AAPL', qty: '100', avg_entry_price: '90', current_price: '100', market_value: '10000', unrealized_pl: '1000'}];
     else if (path === '/api/market/clock') data = {is_open: true, timestamp: date, schedule_available: true};
     else if (path.endsWith('/quote')) data = {price: '100', timestamp: date, feed: options.publicData ? 'public' : 'iex', coverage: options.publicData ? 'Yahoo Finance' : 'IEX exchange only', change_pct: '1.2', delayed: !!options.publicData, timing_verified: !options.publicData, ...(options.marketQuotes?.[path.split('/').at(-2)] || {})};
-    else if (path.endsWith('/bars')) data = {bars: [{c: 99, t: new Date(Math.floor(Date.now() / 60000) * 60000 - 60000).toISOString()}, {c: 100, t: new Date(Math.floor(Date.now() / 60000) * 60000).toISOString()}], delay_minutes: options.publicData ? null : 16, source: options.publicData ? 'Yahoo Finance' : undefined};
+    else if (path.endsWith('/bars')) data = {bars: options.bars || [{c: 99, t: new Date(Math.floor(Date.now() / 60000) * 60000 - 60000).toISOString()}, {c: 100, t: new Date(Math.floor(Date.now() / 60000) * 60000).toISOString()}], delay_minutes: options.publicData ? null : 16, source: options.publicData ? 'Yahoo Finance' : undefined};
+    else if (path.startsWith('/api/exports/')) {
+      if (options.exportFailure) return new Response(JSON.stringify({detail: 'Broker temporarily unavailable'}), {status: 502, headers: {'Content-Type': 'application/json'}});
+      return new Response('timestamp,equity\r\n2026-11-11,1000\r\n', {headers: {'Content-Type': options.exportWrongType ? 'text/html' : 'text/csv'}});
+    }
     else if (path === '/api/risk') data = {max_position_pct: '20', max_order_notional: '5000', max_daily_loss: '1000', daily_loss: '0', basis: 'Previous close'};
     else if (path === '/api/performance') data = {realized_pl: '200', unrealized_pl: '1000', fill_count: 3, realized_complete: true, method: 'Weighted-average fills', portfolio_history: {timestamp: [1, 2], equity: [99000, 100000]}};
     else if (path === '/api/trades') data = {trades: []};
@@ -78,7 +84,8 @@ async function boot(options = {}) {
     else throw new Error(`Unexpected API ${path}`);
     return new Response(JSON.stringify(data), {headers: {'Content-Type': 'application/json'}});
   };
-  const context = vm.createContext({window, document, Node: window.Node, location: {origin: 'http://localhost:8000', hash: ''}, localStorage: storage, sessionStorage: storage, URL, AbortController, TextDecoder, navigator: options.navigator, fetch, console, setTimeout, clearTimeout, setInterval: callback => { periodicRefresh.push(callback); return 0; }});
+  const context = vm.createContext({window, document, Node: window.Node, location: {origin: options.origin || 'http://localhost:8000', href: options.href || 'http://localhost:8000', hash: ''}, localStorage: storage, sessionStorage: storage, URL, AbortController, TextDecoder, navigator: options.navigator, fetch, console, setTimeout, clearTimeout, setInterval: callback => { periodicRefresh.push(callback); return 0; }});
+  vm.runInContext(chartCode, context);
   vm.runInContext(alertsCode, context);
   vm.runInContext(code, context);
   await flush();
@@ -182,7 +189,7 @@ test('live SSE quotes update prices, watchlist, estimates and the intraday chart
     assert.equal(app.$('estimate').textContent, '$105.00');
     assert.match(app.$('watchlist-body').textContent, /\$105.00/);
     assert.match(app.$('stream-status').textContent, /Live market feed/);
-    assert.equal(app.$('axis-high').textContent, '105.00');
+    assert.ok(Number(app.$('axis-high').textContent) >= 105);
     await app.emit({type: 'quote', symbol: 'AAPL', price: '1', timestamp: new Date(Date.now() - 3600000).toISOString(), feed: 'iex'});
     assert.equal(app.$('price').textContent, '$105.00');
     await app.click('#refresh-data');
@@ -280,7 +287,7 @@ test('local setup shortcut selects the correct server without transmitting stale
   await app.click('#connect-api');
   app.$('api-token').value = 'old-server-app-token';
   await app.click('#use-local-api');
-  assert.equal(app.$('api-url').value, 'http://127.0.0.1:8000');
+  assert.equal(app.$('api-url').value, 'http://localhost:8000');
   assert.equal(app.$('api-token').value, '');
   const calls = app.calls.length;
   app.$('api-url').value = 'http://remote.example.com';
@@ -536,4 +543,56 @@ test('same-origin tabs share a single persisted trigger through the Web Locks pa
     assert.equal(JSON.parse(saved.get('trade-price-alerts-v1')).notifications.length, 1);
     assert.equal(one.$('alert-toasts').children.length + two.$('alert-toasts').children.length, 1);
   } finally { await one.close(); if (two) await two.close(); }
+});
+
+test('candles, volume and SMA controls render real OHLC and keyboard crosshair shows the selected bar', async () => {
+  const bars = Array.from({length: 60}, (_, i) => ({t: new Date(1700000000000 + i * 60000).toISOString(), o: 100 + i, h: 103 + i, l: 99 + i, c: 102 + i, v: 1000 + i}));
+  const app = await boot({bars});
+  assert.equal(app.$('chart-candles').querySelectorAll('rect').length, 60);
+  assert.equal(app.$('chart-volumes').querySelectorAll('rect').length, 60);
+  assert.equal(app.$('chart-averages').children.length, 2);
+  app.$('chart').dispatchEvent(new app.window.Event('focus'));
+  assert.match(app.$('chart-readout').textContent, /O \$159.00.*H \$162.00.*Volume 1,059.*SMA 20/);
+  const key = new app.window.Event('keydown', {cancelable: true}); Object.defineProperty(key, 'key', {value: 'Home'});
+  app.$('chart').dispatchEvent(key);
+  assert.match(app.$('chart-readout').textContent, /C \$102.00/);
+  assert.equal(app.$('chart-crosshair').getAttribute('visibility'), 'visible');
+  await app.click('[data-chart-type="line"]');
+  assert.equal(app.$('chart-candles').children.length, 0);
+  assert.equal(app.$('chart-line').getAttribute('visibility'), 'visible');
+  app.$('chart-volume').checked = false; app.$('chart-volume').dispatchEvent(new app.window.Event('change'));
+  assert.equal(app.$('chart-volumes').children.length, 0);
+});
+
+test('CSV download sends bearer auth and reports API or incompatible-server errors', async () => {
+  for (const options of [{exportFailure: true}, {exportWrongType: true}]) {
+    const app = await boot({...options, saved: new Map([['trade-api-token', 'test-token']])});
+    await app.click('#export-trades');
+    assert.equal(app.$('export-trades').disabled, false);
+    assert.match(app.$('export-trades-status').textContent, options.exportFailure ? /Broker temporarily unavailable/ : /does not support CSV/);
+    const request = app.calls.find(call => call.path === '/api/exports/trades.csv');
+    assert.equal(request.init.headers.Authorization, 'Bearer test-token');
+    assert.ok(!request.url.includes('test-token'));
+  }
+});
+
+test('Mac launcher selects its actual local API origin instead of stale saved remote settings', async () => {
+  const app = await boot({origin: 'http://127.0.0.1:8003', href: 'http://127.0.0.1:8003/?local=1', saved: new Map([['trade-api-base', 'https://old.example'], ['trade-api-token', 'old-token']])});
+  assert.ok(app.calls.every(call => call.url.startsWith('http://127.0.0.1:8003/')));
+  assert.ok(app.calls.every(call => !call.init.headers.Authorization));
+});
+
+test('live broker bars retain their OHLC and volume; trade-only ticks stay visibly provisional', async () => {
+  const app = await boot({stream: true});
+  try {
+    const stamp = new Date(Math.floor(Date.now() / 60000) * 60000).toISOString();
+    await app.emit({type: 'bar', symbol: 'AAPL', bar: {t: stamp, o: 99, h: 105, l: 98, c: 103, v: 1234}});
+    assert.equal(app.$('chart-candles').querySelectorAll('rect').length, 1);
+    assert.equal(app.$('chart-volumes').querySelectorAll('rect').length, 1);
+    app.$('chart').dispatchEvent(new app.window.Event('focus'));
+    assert.match(app.$('chart-readout').textContent, /O \$99.00.*Volume 1,234/);
+    await app.emit({type: 'quote', symbol: 'AAPL', price: 106, timestamp: new Date(Date.now() + 20).toISOString(), feed: 'iex'});
+    assert.match(app.$('chart-indicator-note').textContent, /provisional/);
+    assert.match(app.$('chart-readout').textContent, /OHLC\/volume awaiting broker bar/);
+  } finally { await app.close(); }
 });

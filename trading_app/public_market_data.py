@@ -152,12 +152,23 @@ class PublicMarketData:
         data = self.chart(symbol, period)
         try:
             timestamps = data.get('timestamp') or []
-            closes = data['indicators']['quote'][0]['close']
+            quote = data['indicators']['quote'][0]
+            closes = quote['close']
             bars = []
-            for stamp, close in zip(timestamps, closes):
+            for index, (stamp, close) in enumerate(zip(timestamps, closes)):
                 if close is None:
                     continue
-                bars.append({'t': datetime.fromtimestamp(stamp, timezone.utc).isoformat(), 'c': self.price(close)})
+                bar = {'t': datetime.fromtimestamp(stamp, timezone.utc).isoformat(), 'c': self.price(close)}
+                for field, key in [('open', 'o'), ('high', 'h'), ('low', 'l')]:
+                    values = quote.get(field) or []
+                    try:
+                        bar[key] = self.price(values[index])
+                    except (IndexError, PublicDataError):
+                        pass  # Missing OHLC stays missing; the chart can show a close-only line.
+                volumes = quote.get('volume') or []
+                if index < len(volumes) and isinstance(volumes[index], (int, float)) and math.isfinite(volumes[index]) and volumes[index] >= 0:
+                    bar['v'] = volumes[index]
+                bars.append(bar)
         except (KeyError, TypeError, IndexError, ValueError, OSError, OverflowError) as exc:
             raise PublicDataError('The public source returned invalid chart data.') from exc
         return {'bars': bars, 'feed': 'public', 'source': self.source, 'delayed': True,

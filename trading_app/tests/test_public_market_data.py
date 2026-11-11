@@ -95,6 +95,8 @@ def test_no_keys_serves_public_market_data_but_never_account_or_order_data(tmp_p
         assert client.get('/api/account').status_code == 503
         assert client.get('/api/positions').status_code == 503
         assert client.get('/api/performance').status_code == 503
+        assert client.get('/api/exports/trades.csv').status_code == 503
+        assert client.get('/api/exports/performance.csv').status_code == 503
         assert client.post('/api/orders/review', json={'symbol': 'AAPL', 'side': 'buy', 'qty': '1'}).status_code == 503
         assert client.get('/api/market/stream').status_code == 503
         assert app.state.broker is None
@@ -137,3 +139,14 @@ def test_connection_guide_shows_optional_paper_keys_and_public_prices(tmp_path, 
     with TestClient(create_app(db_path=tmp_path / 'no-data.sqlite3', access_token='', allowed_origins=[])) as client:
         report = client.get('/api/connection').json()
         assert report['market_data']['status'] == 'disabled'
+
+
+def test_public_chart_preserves_provider_ohlc_and_volume_without_making_up_missing_fields():
+    data = payload()
+    data['chart']['result'][0]['indicators']['quote'][0].update(
+        open=[99, 100, None], high=[101, 102, 103], low=[98, 99, 100], volume=[12345, 100, None])
+    provider = PublicMarketData(Opener(json.dumps(data).encode()))
+    bars = provider.bars('AAPL')['bars']
+    assert bars[0]['o'] == 99 and bars[0]['h'] == 101 and bars[0]['l'] == 98
+    assert bars[0]['v'] == 12345
+    assert 'o' not in bars[1] and 'v' not in bars[1]

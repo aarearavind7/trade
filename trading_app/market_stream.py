@@ -42,7 +42,12 @@ def normalize_event(event, feed, now=None, symbols=None):
             'coverage': 'IEX exchange only' if feed == 'iex' else feed.upper()}
     if event['T'] == 't':
         return {'type': 'quote', **base, 'price': str(event['p']), 'age_seconds': max(0, round(age))}
-    return {'type': 'bar', **base, 'bar': {'t': event['t'], 'c': price}, 'updated': event['T'] == 'u'}
+    bar = {'t': event['t'], 'c': price}
+    for key in ('o', 'h', 'l', 'v'):
+        value = event.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(value) and (value >= 0 if key == 'v' else value > 0):
+            bar[key] = value
+    return {'type': 'bar', **base, 'bar': bar, 'updated': event['T'] == 'u'}
 
 
 class MarketStream:

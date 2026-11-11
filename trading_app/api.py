@@ -24,6 +24,7 @@ from .market_stream import MarketStream, stream_events, watch_symbols
 from .public_market_data import PublicMarketData, PublicDataError
 from .stock_search import StockSearch, query_text
 from .sp500_catalog import SP500Catalog
+from .csv_export import performance_csv, trades_csv
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,7 +48,7 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         if application.state.market_stream is not None:
             await application.state.market_stream.close()
 
-    application = FastAPI(title='Trade Paper API', version='1.4.0', lifespan=lifespan, description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
+    application = FastAPI(title='Trade Paper API', version='1.5.0', lifespan=lifespan, description='Single-user, long-only Alpaca paper trading. All order submissions require a short-lived server review.')
     application.state.market_stream = None
     application.state.broker = broker
     application.state.public_market_data = public_client or PublicMarketData()
@@ -283,6 +284,15 @@ def create_app(broker=None, db_path=None, limits=None, access_token=None, allowe
         fills, complete = svc.broker.fills()
         return {'trades': sorted(fills, key=lambda f: (f['transaction_time'], f['id']), reverse=True)[:limit],
                 'coverage_complete': complete, 'returned_limit': limit}
+
+    @application.get('/api/exports/trades.csv')
+    def export_trades(svc=Depends(service)):
+        fills, complete = svc.broker.fills()
+        return trades_csv(fills, complete)
+
+    @application.get('/api/exports/performance.csv')
+    def export_performance(svc=Depends(service)):
+        return performance_csv(performance(svc))
 
     application.mount('/', StaticFiles(directory=ROOT / 'web', html=True), name='dashboard')
     return application

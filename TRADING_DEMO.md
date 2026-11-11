@@ -13,13 +13,13 @@ git pull origin main
 
 You can also double-click **start.command** in Finder. The launcher finds a supported Python, creates the project `.venv` if needed, installs missing/changed runtime dependencies, and creates a private `.env` template only when one does not already exist. It preserves existing keys and trading state. The first setup may need internet access to download dependencies.
 
-The browser opens **after** the API is ready. Leave the launcher Terminal open; use **Ctrl+C** to stop it. Stop any older server first when applying backend updates. An already running compatible Trade server is reused; an unrelated process on the port is reported without being stopped.
+The browser opens **after** the API is ready. Leave the launcher Terminal open; use **Ctrl+C** to stop it. Stop any older server first when applying backend updates. An already running compatible Trade server is reused. If an unrelated process occupies the default port, the launcher automatically tries ports 8001–8019 without stopping that process.
 
-If the port is occupied, use `./start.command --port 8001`. To suppress browser opening, add `--no-browser`. If the executable permission was lost while copying files, run `chmod +x start.command` once. Python older than 3.11 and older existing virtual environments produce setup instructions rather than being deleted automatically.
+To select an exact port, use `./start.command --port 8001`; an occupied explicit port produces instructions instead of switching ports. The browser opens `/?local=1` on the chosen address so stale saved remote API settings cannot redirect the dashboard to another server. If that changes the saved API origin, its old session token is cleared; enter the local application token in Connection setup if required. To suppress browser opening, add `--no-browser`. If the executable permission was lost while copying files, run `chmod +x start.command` once. Python older than 3.11 and older existing virtual environments produce setup instructions rather than being deleted automatically.
 
 ## Guided connection setup
 
-Click **Connection setup** in the dashboard header. Choose **Use local server** for `http://127.0.0.1:8000`, or enter the address printed by your launcher if you selected another port. A hosted API can still use its own HTTPS origin.
+Click **Connection setup** in the dashboard header. Choose **Use local server** for the current local page origin (including its port), or `http://127.0.0.1:8000` when viewing a hosted page. You can also enter the address printed by your launcher. A hosted API can still use its own HTTPS origin.
 
 **Check connection** performs three read-only checks:
 
@@ -74,6 +74,23 @@ This public chart endpoint is an external, unauthenticated service and can chang
 Balances, positions, P/L, and order history require an actual account and are hidden in market-only mode. Order submission, review, and Alpaca streaming remain disabled without a configured paper account. Public prices are never passed to the broker order/risk service. Once valid Alpaca configuration is loaded and the server restarted, the existing paper-trading and Alpaca streaming workflow applies. Syntactically configured but rejected Alpaca credentials still need to be corrected; broker authentication failures are not silently relabelled as public data.
 
 Set `PUBLIC_MARKET_DATA=false` to disable the public fallback and retain the setup-required screen until Alpaca credentials are available.
+
+## Candlesticks, volume, and moving averages
+
+The market chart starts in **Candles** mode; choose **Line** for closing prices. Green candles close at or above their open, red candles close below it, and wicks show each bar's high and low. **Volume** adds separately scaled bars beneath prices. **SMA 20** (gold) and **SMA 50** (purple) are simple averages of the last 20 / 50 bar closes at the selected chart timeframe, not necessarily calendar days. A moving-average line begins only once enough real bars are available. Each indicator has its own toggle.
+
+Hover or tap the chart for a crosshair with cursor price and bar time. The readout shows that bar's open, high, low, close, volume, and enabled averages. Times use your browser's local timezone. Focus the chart and use **← / →**, **Home**, or **End** to inspect bars; **Escape** clears the selection.
+
+OHLC and volume come from Alpaca historical/stream bars or Yahoo Finance chart fields. Missing fields are never synthesized: incomplete candles show close dots, a close-only series falls back to a line, and missing volume is marked unavailable. Live trade ticks supply provisional close dots until the broker supplies the complete minute bar. Longer ranges refresh historical bars normally. Delay/source labels still apply; these indicators do not make delayed data real-time. At most 1,500 recent bars are drawn, with averages calculated from the available returned history before that display cutoff.
+
+## Download CSV records
+
+Use **Download CSV** in **Trade history** or **Portfolio performance**. These account-only downloads require configured Alpaca paper credentials and the same API access token as other account routes. Public-price mode cannot supply account records.
+
+- Trade history exports all available broker fills (up to the existing 10,000-fill retrieval bound), rather than only the latest 100 displayed rows. Columns include fill/order IDs, broker timestamp, symbol, side, quantity, price, decimal-calculated value, currency, and `fill_history_complete`. A false coverage flag means the provider history was truncated; it is not a complete lifetime ledger.
+- Performance exports the broker's last month of daily equity observations: UTC timestamp, equity, provider P/L and P/L ratio, base value, and timeframe. Current realized/unrealized P/L and fill-accounting coverage are repeated as explicitly named **current** summary columns; they are not historical daily realized P/L. Unreconciled realized P/L and missing provider values remain blank. `broker_profit_loss_ratio` uses 0.01 for 1%.
+
+Files are UTF-8 CSV with a BOM for spreadsheet compatibility. Empty history produces column headings with no records. Text fields that could be interpreted as spreadsheet formulas are escaped. Export failures appear beside the button; an error page is never downloaded as a CSV. Read-only routes are `GET /api/exports/trades.csv` and `GET /api/exports/performance.csv`.
 
 ## Stock search and custom watchlist
 
@@ -213,7 +230,7 @@ npm ci --prefix web
 npm test --prefix web
 ```
 
-Tests use mocked broker responses and browser DOM/network adapters; they never contact Alpaca. They cover order validation, duplicate/concurrent submissions, crash and timeout recovery, risk reservations, quote staleness, API authorization/failures, fill accounting, review/confirmation, browser recovery after uncertain submissions, shared stream connections, reconnection/denials, fragmented SSE parsing, stale snapshot protection, connection diagnostics, rejected settings, launcher setup, port conflicts, orderly startup/shutdown, stock search/filtering, watchlist persistence and empty states, stale search responses, dynamic stream isolation across tabs, full S&P 500 imports, membership-source failures, duplicate prevention, and page-bounded price/stream requests, above/below alerts, stale/duplicate quote rejection, cross-tab notification deduplication, off-page monitoring, persistence, and alert management.
+Tests use mocked broker responses and browser DOM/network adapters; they never contact Alpaca. They cover order validation, duplicate/concurrent submissions, crash and timeout recovery, risk reservations, quote staleness, API authorization/failures, fill accounting, review/confirmation, browser recovery after uncertain submissions, shared stream connections, reconnection/denials, fragmented SSE parsing, stale snapshot protection, connection diagnostics, rejected settings, launcher setup, automatic port selection and local-origin recovery, orderly startup/shutdown, OHLC/volume propagation, SMA/crosshair calculations and controls, authenticated CSV export/coverage/precision, stock search/filtering, watchlist persistence and empty states, stale search responses, dynamic stream isolation across tabs, full S&P 500 imports, membership-source failures, duplicate prevention, and page-bounded price/stream requests, above/below alerts, stale/duplicate quote rejection, cross-tab notification deduplication, off-page monitoring, persistence, and alert management.
 
 `.github/workflows/trading-tests.yml` runs the Python suite on 3.11, 3.12, and 3.13 with an 80% coverage floor, checks JavaScript syntax, and runs dashboard tests. Existing repository-validation workflows remain in place. DOM tests do not replace full visual browser testing or an integration check with your own paper account.
 

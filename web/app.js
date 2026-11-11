@@ -71,6 +71,13 @@ const STOCKS = loadWatchlist();
 let searchEpoch = 0, searchTimer = null, searchResults = [];
 let apiBase = storage.get('trade-api-base') || location.origin;
 let apiToken = storage.get('trade-api-token', true);
+// The Mac launcher explicitly chooses its own origin, including an alternate port.
+const localLaunch = new URL(location.href || location.origin).searchParams.get('local') === '1' && ['127.0.0.1', 'localhost', '[::1]'].includes(new URL(location.origin).hostname);
+if (localLaunch) {
+  if (apiBase !== location.origin) apiToken = '';
+  apiBase = location.origin;
+  storage.set('trade-api-base', apiBase); storage.set('trade-api-token', apiToken, true);
+}
 let selected = STOCKS[0] || DEFAULT_STOCKS[0], side = 'buy', range = '1D', review = null;
 let connected = false, refreshing = false, submitting = false, selectionEpoch = 0;
 let configurationBlocked = false, publicMarketMode = false, marketConnected = false;
@@ -134,6 +141,35 @@ function table(headers, rows, emptyText) {
   rows.forEach(values => { const row = element('tr'); values.forEach(value => { const cell = element('td'); if (value instanceof Node) cell.append(value); else cell.textContent = value; row.append(cell); }); body.append(row); });
   grid.append(head, body); wrap.append(grid); return wrap;
 }
+async function downloadCsv(kind) {
+  const button = $(`export-${kind}`), status = $(`export-${kind}-status`);
+  if (button.disabled) return;
+  button.disabled = true; status.textContent = 'Preparing broker records…';
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 60000);
+  const base = apiBase, token = apiToken;
+  let objectUrl;
+  try {
+    const response = await fetch(`${base}/api/exports/${kind}.csv`, {headers: {Accept: 'text/csv', ...(token ? {Authorization: `Bearer ${token}`} : {})}, signal: controller.signal, cache: 'no-store', credentials: 'omit'});
+    if (!response.ok) {
+      const data = (response.headers.get('content-type') || '').includes('application/json') ? await response.json() : null;
+      throw new Error(data?.detail || `CSV export failed (${response.status}).`);
+    }
+    if (!(response.headers.get('content-type') || '').includes('text/csv')) throw new Error('This server does not support CSV downloads. Pull the latest code and restart the server.');
+    const blob = await response.blob();
+    if (base !== apiBase || token !== apiToken) throw new Error('Connection changed. Download again from the selected account.');
+    objectUrl = URL.createObjectURL(blob);
+    const link = element('a'); link.href = objectUrl;
+    link.download = `${kind === 'trades' ? 'trade-history' : 'portfolio-performance'}-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.append(link); link.click(); link.remove();
+    status.textContent = kind === 'trades' ? 'CSV downloaded: all available broker fills (up to 10,000); see fill_history_complete for coverage.' : 'CSV downloaded: last month of broker equity history, with current P/L summary columns.';
+  } catch (error) {
+    status.textContent = error.name === 'AbortError' ? 'CSV export timed out. Try again.' : error.message;
+  } finally {
+    clearTimeout(timer); button.disabled = false;
+    if (objectUrl) setTimeout(() => URL.revokeObjectURL(objectUrl), 10000);
+  }
+}
+['trades', 'performance'].forEach(kind => $(`export-${kind}`).addEventListener('click', () => downloadCsv(kind)));
 function statusBadge(status) {
   const label = ['accepted', 'new', 'pending_new', 'accepted_for_bidding'].includes(status) ? 'pending' : status;
   return element('span', (label || 'unknown').replaceAll('_', ' '), `status-badge ${label}`);
@@ -186,20 +222,103 @@ function linePath(values, width, height, padding = 12) {
   const low = Math.min(...values), high = Math.max(...values), spread = high - low || Math.max(1, high * .01);
   return values.map((value, index) => `${index ? 'L' : 'M'}${(index * width / Math.max(1, values.length - 1)).toFixed(2)},${(height - padding - (value - low) / spread * (height - padding * 2)).toFixed(2)}`).join(' ');
 }
-function renderChart() {
-  const valid = currentBars.filter(bar => Number.isFinite(Number(bar.c)));
-  const values = valid.map(bar => Number(bar.c)), path = linePath(values, 760, 240);
-  $('chart-line').setAttribute('d', path);
-  $('chart-area').setAttribute('d', values.length ? `${path} L760,240 L0,240 Z` : '');
-  $('chart-empty').hidden = !!values.length;
-  $('chart-empty').textContent = STOCKS.length ? 'No historical bars available for this range.' : 'Your watchlist is empty. Add a stock to see its chart.';
-  $('chart').setAttribute('aria-label', `${selected.name} ${range} price chart. Feed timestamps and delay status are shown below.`);
-  $('axis-high').textContent = values.length ? Math.max(...values).toFixed(2) : '';
-  $('axis-mid').textContent = values.length ? ((Math.max(...values) + Math.min(...values)) / 2).toFixed(2) : '';
-  $('axis-low').textContent = values.length ? Math.min(...values).toFixed(2) : '';
-  const marks = valid.length ? [0, Math.floor((valid.length - 1) / 2), valid.length - 1] : [];
-  $('chart-times').replaceChildren(...marks.map(index => element('span', new Date(valid[index].t).toLocaleString(undefined, range === '1D' ? {hour: 'numeric', minute: '2-digit'} : {month: 'short', day: 'numeric'}))));
+let chartType = 'candles', chartModel = null, chartCursor = null;
+function svgElement(tag, attrs) {
+  const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, String(value)));
+  return node;
 }
+function inspectChart(index, cursorY) {
+  if (!chartModel?.bars.length) return;
+  const chart = chartModel, i = Math.max(0, Math.min(chart.bars.length - 1, index)), bar = chart.bars[i];
+  chartCursor = i;
+  const x = chart.x(i), y = cursorY == null ? chart.y(bar.c) : Math.max(12, Math.min(204, cursorY));
+  $('chart-crosshair').setAttribute('visibility', 'visible');
+  $('crosshair-lines').setAttribute('d', `M${x},12V282 M0,${y}H760`);
+  $('crosshair-point').setAttribute('cx', x); $('crosshair-point').setAttribute('cy', chart.y(bar.c));
+  const labelX = x > 650 ? 0 : 678;
+  $('crosshair-price-bg').setAttribute('x', labelX); $('crosshair-price-bg').setAttribute('y', y - 9);
+  $('crosshair-price').setAttribute('x', labelX + 41); $('crosshair-price').setAttribute('y', y + 4);
+  $('crosshair-price').textContent = money(chart.priceAt(y));
+  const timeX = Math.max(0, Math.min(560, x - 100));
+  $('crosshair-time-bg').setAttribute('x', timeX); $('crosshair-time').setAttribute('x', timeX + 100);
+  $('crosshair-time').textContent = new Date(bar.t).toLocaleString();
+  const parts = [time(bar.t), `O ${money(bar.o)}`, `H ${money(bar.h)}`, `L ${money(bar.l)}`, `C ${money(bar.c)}`, `Volume ${bar.v == null ? 'unavailable' : quantity(bar.v)}`];
+  chart.lines.forEach(line => parts.push(`SMA ${line.period} ${money(line.values[i])}`));
+  if (bar.provisional) parts.push('Live close · OHLC/volume awaiting broker bar');
+  $('chart-readout').textContent = parts.join(' · ');
+  $('chart').setAttribute('aria-label', `${selected.symbol} ${range}: ${parts.join(', ')}. Use left and right arrows to inspect bars.`);
+}
+function clearChartCursor() {
+  chartCursor = null; $('chart-crosshair').setAttribute('visibility', 'hidden');
+  $('chart-readout').textContent = 'Hover, tap, or focus the chart and use ← / → to inspect a bar.';
+}
+function renderChart() {
+  const periods = [20, 50].filter(period => $(`chart-ma${period}`).checked);
+  const chart = TradeChart.model(currentBars, {averages: periods}); chartModel = chart;
+  const bars = chart.bars, values = bars.map(bar => bar.c), path = TradeChart.path(values, chart);
+  $('chart-line').setAttribute('d', path);
+  const hasCandles = bars.some(bar => bar.o != null), candles = chartType === 'candles' && hasCandles;
+  $('chart-line').setAttribute('visibility', candles ? 'hidden' : 'visible');
+  $('chart-area').setAttribute('d', !candles && bars.length ? `${path} L${chart.x(bars.length - 1)},204 L${chart.x(0)},204 Z` : '');
+  const candleRoot = $('chart-candles'), volumes = $('chart-volumes'), averages = $('chart-averages');
+  candleRoot.replaceChildren(); volumes.replaceChildren(); averages.replaceChildren();
+  const width = Math.max(.35, Math.min(12, 760 / Math.max(1, bars.length) * .7));
+  bars.forEach((bar, i) => {
+    const x = chart.x(i), color = (bar.o == null ? i === 0 || bar.c >= bars[i - 1].c : bar.c >= bar.o) ? '#168768' : '#c26655';
+    if (candles && bar.o != null) {
+      candleRoot.append(svgElement('path', {d: `M${x},${chart.y(bar.h)}V${chart.y(bar.l)}`, stroke: color, 'vector-effect': 'non-scaling-stroke'}));
+      candleRoot.append(svgElement('rect', {x: x - width / 2, y: Math.min(chart.y(bar.o), chart.y(bar.c)), width, height: Math.max(.9, Math.abs(chart.y(bar.o) - chart.y(bar.c))), fill: color}));
+    } else if (candles) {
+      candleRoot.append(svgElement('circle', {cx: x, cy: chart.y(bar.c), r: 1.8, fill: color}));
+    }
+    if ($('chart-volume').checked && bar.v != null) {
+      const height = bar.v / chart.maxVolume * 48;
+      volumes.append(svgElement('rect', {x: x - width / 2, y: 280 - height, width, height, fill: color, opacity: .45}));
+    }
+  });
+  chart.lines.forEach(line => averages.append(svgElement('path', {d: TradeChart.path(line.values, chart), fill: 'none', stroke: line.period === 20 ? '#bd8c32' : '#7d73b2', 'stroke-width': 1.6, 'vector-effect': 'non-scaling-stroke'})));
+  const notes = ['SMA 20 / 50 use bar closes; each needs that many bars.'];
+  if (chartType === 'candles' && !hasCandles && bars.length) notes.push('OHLC unavailable: showing closing-price line.');
+  else if (candles && bars.some(bar => bar.o == null)) notes.push('Dots mark closes with incomplete OHLC.');
+  if ($('chart-volume').checked) notes.push(bars.some(bar => bar.v != null) ? 'Volume scaled separately below prices.' : 'Volume unavailable for these bars.');
+  if (bars.some(bar => bar.provisional)) notes.push('Live closes are provisional; complete OHLC and volume arrive with broker bars.');
+  if (chart.truncated) notes.push('Showing the most recent 1,500 bars.');
+  $('chart-indicator-note').textContent = notes.join(' ');
+  $('chart-empty').hidden = !!bars.length;
+  $('chart-empty').textContent = STOCKS.length ? 'No historical bars available for this range.' : 'Your watchlist is empty. Add a stock to see its chart.';
+  $('chart').setAttribute('aria-label', `${selected.name} ${range} ${candles ? 'candlestick' : 'line'} chart. Use left and right arrows to inspect bars. Feed timestamps and delay status are shown below.`);
+  $('axis-high').textContent = bars.length ? chart.high.toFixed(2) : '';
+  $('axis-mid').textContent = bars.length ? ((chart.high + chart.low) / 2).toFixed(2) : '';
+  $('axis-low').textContent = bars.length ? chart.low.toFixed(2) : '';
+  const marks = bars.length ? [0, Math.floor((bars.length - 1) / 2), bars.length - 1] : [];
+  $('chart-times').replaceChildren(...marks.map(index => element('span', new Date(bars[index].t).toLocaleString(undefined, range === '1D' ? {hour: 'numeric', minute: '2-digit'} : {month: 'short', day: 'numeric'}))));
+  if (chartCursor != null && bars.length) inspectChart(chartCursor); else clearChartCursor();
+}
+function pointChart(event) {
+  if (!chartModel?.bars.length) return;
+  const box = $('chart').getBoundingClientRect();
+  if (!box.width || !box.height) return;
+  inspectChart(chartModel.nearest((event.clientX - box.left) / box.width * 760), (event.clientY - box.top) / box.height * 300);
+}
+$('chart').addEventListener('pointermove', pointChart);
+$('chart').addEventListener('pointerdown', pointChart);
+$('chart').addEventListener('pointerleave', clearChartCursor);
+$('chart').addEventListener('focus', () => { if (chartModel?.bars.length) inspectChart(chartModel.bars.length - 1); });
+$('chart').addEventListener('blur', clearChartCursor);
+$('chart').addEventListener('keydown', event => {
+  if (!chartModel?.bars.length || !['ArrowLeft', 'ArrowRight', 'Home', 'End', 'Escape'].includes(event.key)) return;
+  event.preventDefault();
+  if (event.key === 'Escape') { clearChartCursor(); return; }
+  const i = chartCursor ?? chartModel.bars.length - 1;
+  inspectChart(event.key === 'Home' ? 0 : event.key === 'End' ? chartModel.bars.length - 1 : i + (event.key === 'ArrowLeft' ? -1 : 1));
+});
+document.querySelectorAll('[data-chart-type]').forEach(button => button.addEventListener('click', () => {
+  chartType = button.dataset.chartType;
+  document.querySelectorAll('[data-chart-type]').forEach(item => { const active = item === button; item.classList.toggle('selected', active); item.setAttribute('aria-pressed', String(active)); });
+  renderChart();
+}));
+['chart-volume', 'chart-ma20', 'chart-ma50'].forEach(id => $(id).addEventListener('change', renderChart));
 async function loadSelected() {
   if (!STOCKS.some(stock => stock.symbol === selected.symbol)) return;
   const epoch = ++selectionEpoch, symbol = selected.symbol, period = range;
@@ -224,7 +343,7 @@ function selectStock(symbol) {
   }
   $('symbol').value = selected.symbol;
   document.querySelectorAll('[data-stock]').forEach(button => { const active = button.dataset.stock === symbol; button.classList.toggle('selected', active); button.setAttribute('aria-pressed', String(active)); });
-  currentBars = []; renderQuote(); renderChart();
+  currentBars = []; clearChartCursor(); renderQuote(); renderChart();
   if (marketConnected || connected) loadSelected();
 }
 function renderWatchlist() {
@@ -320,22 +439,28 @@ function saveSnapshot(symbol, snapshot) {
   }
 }
 function mergeLiveBars(symbol) {
-  const merged = new Map(currentBars.map(bar => { const t = new Date(bar.t).toISOString(); return [t, {...bar, t}]; }));
-  const first = currentBars.length ? new Date(currentBars[0].t).getTime() : Date.now() - 86400000;
+  const merged = new Map(currentBars.filter(bar => Number.isFinite(TradeChart.timestamp(bar.t))).map(bar => { const t = new Date(TradeChart.timestamp(bar.t)).toISOString(); return [t, {...bar, t}]; }));
+  const first = currentBars.length ? TradeChart.timestamp(currentBars[0].t) : Date.now() - 86400000;
   for (const bar of liveBars.get(symbol)?.values() || []) {
-    if (new Date(bar.t).getTime() >= first) merged.set(bar.t, bar);
+    if (TradeChart.timestamp(bar.t) >= first) merged.set(bar.t, bar);
   }
   currentBars = [...merged.values()].sort((a, b) => new Date(a.t) - new Date(b.t)).slice(-1500);
 }
 function rememberLiveBar(symbol, bar, source) {
-  const stamp = new Date(bar.t).getTime();
+  const stamp = TradeChart.timestamp(bar.t);
   if (!Number.isFinite(stamp) || !Number.isFinite(Number(bar.c)) || Number(bar.c) <= 0) return;
   const key = new Date(Math.floor(stamp / 60000) * 60000).toISOString();
   if (!liveBars.has(symbol)) liveBars.set(symbol, new Map());
   const cache = liveBars.get(symbol), old = cache.get(key);
   // Completed/updated broker bars may correct the close; older trade ticks must not replace newer ticks.
   if (source === 'trade' && old && old._tradeTime > stamp) return;
-  cache.set(key, {t: key, c: Number(bar.c), _tradeTime: source === 'trade' ? stamp : old?._tradeTime || stamp});
+  if (source === 'bar') {
+    const corrected = {...bar, t: key, c: Number(bar.c), _tradeTime: old?._tradeTime || stamp};
+    cache.set(key, corrected);
+  } else {
+    // A trade tick supplies only a provisional close. Do not invent a candle or volume.
+    cache.set(key, {t: key, c: Number(bar.c), _tradeTime: stamp, _provisional: true});
+  }
   while (cache.size > 1500) cache.delete(cache.keys().next().value);
   if (symbol === selected.symbol && range === '1D') { mergeLiveBars(symbol); renderChart(); }
 }
@@ -600,7 +725,7 @@ renderStockSelectors();
 $('symbol').addEventListener('change', event => selectStock(event.target.value));
 ['quantity', 'limit-price'].forEach(id => $(id).addEventListener('input', updateEstimate));
 $('order-type').addEventListener('change', updateEstimate);
-document.querySelectorAll('[data-range]').forEach(button => button.addEventListener('click', () => { range = button.dataset.range; document.querySelectorAll('[data-range]').forEach(item => { item.classList.toggle('selected', item === button); item.setAttribute('aria-pressed', String(item === button)); }); if (marketConnected || connected) loadSelected(); }));
+document.querySelectorAll('[data-range]').forEach(button => button.addEventListener('click', () => { range = button.dataset.range; currentBars = []; clearChartCursor(); renderChart(); document.querySelectorAll('[data-range]').forEach(item => { item.classList.toggle('selected', item === button); item.setAttribute('aria-pressed', String(item === button)); }); if (marketConnected || connected) loadSelected(); }));
 document.querySelectorAll('[data-side]').forEach(button => button.addEventListener('click', () => { side = button.dataset.side; document.querySelectorAll('[data-side]').forEach(item => { item.classList.toggle('selected', item === button); item.setAttribute('aria-pressed', String(item === button)); }); message(''); updateEstimate(); }));
 $('order-form').addEventListener('submit', async event => {
   event.preventDefault();
@@ -846,7 +971,7 @@ $('connect-api').addEventListener('click', () => {
 });
 $('test-connection').addEventListener('click', () => checkConnection());
 $('use-local-api').addEventListener('click', () => {
-  $('api-url').value = 'http://127.0.0.1:8000'; $('api-token').value = ''; lastConnectionCheck = null;
+  $('api-url').value = ['127.0.0.1', 'localhost', '[::1]'].includes(new URL(location.origin).hostname) ? location.origin : 'http://127.0.0.1:8000'; $('api-token').value = ''; lastConnectionCheck = null;
   $('connection-error').textContent = ''; $('connection-summary').textContent = 'Local server selected. Run ./start.command and click Check connection.';
   ['server', 'market', 'account'].forEach(name => connectionCheckRow(name, {status: 'not_checked', message: 'Run the connection check.'}));
 });

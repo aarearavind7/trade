@@ -215,3 +215,10 @@ def test_stream_capacity_error_is_delivered_as_terminal_sse():
                 events = [event async for event in stream_events(hub, Request(), ['C' + str(index) for index in range(20)])]
                 assert len(events) == 1 and '50 distinct' in events[0] and '"retryable":false' in events[0]
     asyncio.run(scenario())
+
+
+def test_stream_preserves_actual_bar_ohlc_and_volume_but_never_synthesizes_them():
+    event = normalize_event(trade(T='b', o=200, h=204, l=199, c=202, v=1234), 'iex', NOW)
+    assert event['bar']['o'] == 200 and event['bar']['v'] == 1234
+    event = normalize_event(trade(T='b', c=202, v=-1), 'iex', NOW)
+    assert 'o' not in event['bar'] and 'v' not in event['bar']

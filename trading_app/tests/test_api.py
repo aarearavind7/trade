@@ -101,6 +101,7 @@ def test_market_account_and_static_endpoints(client):
     assert client.get('/').status_code == 200
     assert client.get('/app.js').status_code == 200
     assert client.get('/price-alerts.js').status_code == 200
+    assert client.get('/chart-data.js').status_code == 200
     assert client.get('/api/health').json()['mode'] == 'paper'
     assert client.get('/api/account').json()['cash'] == '100000'
     assert client.get('/api/positions').json() == []
@@ -430,3 +431,69 @@ def test_stream_validates_custom_symbols_before_connecting(client, app):
     assert client.get('/api/market/stream?symbols=../BAD').status_code == 422
     assert client.get('/api/market/stream?symbols=').status_code == 422
     assert app.state.market_stream is None
+
+
+def test_trade_csv_exports_all_fills_with_exact_decimals_and_formula_escaping(client, broker):
+    import csv
+    from io import StringIO
+    broker.fill_data = [{'id': f'fill-{i}', 'order_id': '=HYPERLINK("bad")', 'transaction_time': '2026-11-11T12:00:00Z',
+                         'symbol': 'AAPL', 'side': 'buy', 'qty': '0.1', 'price': '0.2'} for i in range(105)]
+    response = client.get('/api/exports/trades.csv')
+    assert response.status_code == 200
+    assert response.headers['content-type'].startswith('text/csv')
+    assert 'attachment' in response.headers['content-disposition']
+    assert response.headers['cache-control'] == 'no-store'
+    rows = list(csv.DictReader(StringIO(response.content.decode('utf-8-sig'))))
+    assert len(rows) == 105
+    assert rows[0]['value_usd'] == '0.02'
+    assert rows[0]['order_id'].startswith("'=HYPERLINK")
+    assert rows[0]['fill_history_complete'] == 'true'
+
+
+def test_performance_csv_exports_broker_times_and_does_not_fill_missing_history_values(client, broker):
+    import csv
+    from io import StringIO
+    broker.portfolio_history = lambda: {'timestamp': [1794236400, 1794322800], 'equity': [99000, 100000],
+                                       'profit_loss': [-1000], 'profit_loss_pct': [-.01], 'base_value': 100000, 'timeframe': '1D'}
+    response = client.get('/api/exports/performance.csv')
+    assert response.status_code == 200
+    rows = list(csv.DictReader(StringIO(response.content.decode('utf-8-sig'))))
+    assert len(rows) == 2
+    assert rows[0]['timestamp_utc'].endswith('+00:00')
+    assert rows[0]['broker_profit_loss_usd'] == '-1000'
+    assert rows[1]['broker_profit_loss_usd'] == ''
+    assert rows[1]['equity_usd'] == '100000'
+    assert rows[0]['current_realized_pl_usd'] == '0'
+
+
+def test_csv_routes_require_access_token_and_never_return_account_records_without_auth(broker, tmp_path):
+    app = create_app(broker=broker, db_path=tmp_path / 'csv.sqlite', access_token='csv-token', allowed_origins=[])
+    with TestClient(app) as client:
+        for path in ['/api/exports/trades.csv', '/api/exports/performance.csv']:
+            assert client.get(path).status_code == 401
+            assert client.get(path, headers={'Authorization': 'Bearer csv-token'}).status_code == 200
+
+
+def test_empty_and_incomplete_csv_history_are_explicit(client, broker):
+    import csv
+    from io import StringIO
+    response = client.get('/api/exports/trades.csv')
+    assert list(csv.DictReader(StringIO(response.content.decode('utf-8-sig')))) == []
+    broker.fills = lambda: ([{'id': 'fill', 'transaction_time': '2026-11-11T12:00:00Z', 'symbol': 'AAPL', 'side': 'buy', 'qty': '1', 'price': '100'}], False)
+    response = client.get('/api/exports/trades.csv')
+    assert 'false' in response.text
+    response = client.get('/api/exports/performance.csv')
+    rows = list(csv.DictReader(StringIO(response.content.decode('utf-8-sig'))))
+    assert rows[0]['realized_complete'] == 'false'
+    assert rows[0]['current_realized_pl_usd'] == ''
+
+
+def test_csv_broker_failure_is_json_error_instead_of_download(client, broker):
+    def unavailable():
+        raise AlpacaError('Broker unavailable')
+    broker.fills = unavailable
+    for path in ['/api/exports/trades.csv', '/api/exports/performance.csv']:
+        response = client.get(path)
+        assert response.status_code == 502
+        assert response.headers['content-type'].startswith('application/json')
+        assert 'content-disposition' not in response.headers

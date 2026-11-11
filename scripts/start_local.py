@@ -103,29 +103,39 @@ def open_dashboard(url, enabled):
     if not enabled:
         return
     try:
-        opened = webbrowser.open(url)
+        opened = webbrowser.open(url + '/?local=1')
     except webbrowser.Error:
         opened = False
     if not opened:
-        print('Open this address in your browser: ' + url, flush=True)
+        print('Open this address in your browser: ' + url + '/?local=1', flush=True)
 
 
 def main(argv=None, root=ROOT):
     parser = argparse.ArgumentParser(description='Prepare and run Trade locally; open the browser after the API is ready.')
-    parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--port', type=int, help='Use this exact port. By default, find an available port from 8000 to 8019.')
     parser.add_argument('--no-browser', action='store_true', help='Start without opening a browser.')
     args = parser.parse_args(argv)
     if sys.version_info < (3, 11):
         print('Trade needs Python 3.11 or newer. Install it from python.org, then run start.command again.', file=sys.stderr)
         return 1
-    if not 1024 <= args.port <= 65535:
+    if args.port is not None and not 1024 <= args.port <= 65535:
         parser.error('--port must be between 1024 and 65535')
-    url = 'http://127.0.0.1:' + str(args.port)
     process = None
     try:
-        if port_is_open(args.port):
+        port = args.port
+        if port is None:
+            for candidate in range(8000, 8020):
+                if not port_is_open(candidate) or trade_is_ready('http://127.0.0.1:' + str(candidate)):
+                    port = candidate
+                    break
+            if port is None:
+                raise RuntimeError('Ports 8000–8019 are busy. Choose another with ./start.command --port 8020.')
+            if port != 8000:
+                print(f'Port 8000 is busy. Using port {port}.', flush=True)
+        url = 'http://127.0.0.1:' + str(port)
+        if port_is_open(port):
             if not trade_is_ready(url):
-                raise RuntimeError(f'Port {args.port} is already in use. Stop the old server in its Terminal with Ctrl+C, or run ./start.command --port {args.port + 1 if args.port < 65535 else 8000}.')
+                raise RuntimeError(f'Port {port} is already in use. Stop the old server in its Terminal with Ctrl+C, or run ./start.command --port {port + 1 if port < 65535 else 8000}.')
             print('Trade is already running at ' + url + '. Opening the dashboard.', flush=True)
             print('After a code update, restart the existing server to load backend changes.', flush=True)
             open_dashboard(url, not args.no_browser)
@@ -133,7 +143,7 @@ def main(argv=None, root=ROOT):
         interpreter = prepare_environment(root)
         print('\nStarting Trade at ' + url, flush=True)
         command = [str(interpreter), '-m', 'uvicorn', 'trading_app.api:app', '--host', '127.0.0.1',
-                   '--port', str(args.port), '--no-proxy-headers', '--timeout-graceful-shutdown', '5']
+                   '--port', str(port), '--no-proxy-headers', '--timeout-graceful-shutdown', '5']
         process = subprocess.Popen(command, cwd=str(root), start_new_session=True)
         wait_until_ready(process, url)
         print('\nReady: ' + url + '\nKeep this Terminal open. Press Ctrl+C to stop the app.\n', flush=True)
