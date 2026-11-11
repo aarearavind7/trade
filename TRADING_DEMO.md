@@ -234,6 +234,12 @@ Tests use mocked broker responses and browser DOM/network adapters; they never c
 
 `.github/workflows/trading-tests.yml` runs the Python suite on 3.11, 3.12, and 3.13 with an 80% coverage floor, checks JavaScript syntax, and runs dashboard tests. Existing repository-validation workflows remain in place. DOM tests do not replace full visual browser testing or an integration check with your own paper account.
 
+## Personal bank funding
+
+The **Funding** navigation item opens a bank-funding guide for your own US Alpaca account. **Open Alpaca dashboard** opens `https://app.alpaca.markets/` in a new tab. Sign in there, select your approved live account, and follow Alpaca's bank-linking, ACH deposit review and transfer-status flow. This link is a handoff to the broker dashboard, not an embedded funding integration or a direct deposit endpoint.
+
+The app remains paper-only. It does not collect bank details, initiate transfers, display live deposited funds, or change the paper balance after a real deposit. You do not need to add live credentials to this app. Funding other customers' accounts requires a separate Alpaca Broker API implementation and provider onboarding; that is not included in this personal-account shortcut.
+
 ## Company fundamentals and stock screener
 
 The **Research** panel follows the selected watchlist symbol. It shows annual revenue/net income, trailing P/E, annual balance-sheet debt, market cap, sector, and the next provider-listed earnings date within 90 days. Financial-statement dates and reporting currency are shown; unavailable values stay blank rather than becoming zero. Earnings dates are provisional and can change. Use **Load financials** to retry. Financial responses are cached for up to one hour.
